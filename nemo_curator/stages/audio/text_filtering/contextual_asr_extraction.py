@@ -19,6 +19,12 @@ text-only LLM to extract contextual-ASR biasing information: domain
 labels, named entities across 9 category buckets, distractor terms,
 confidence scores, speaking style, and difficulty estimation.
 
+The user prompt template supports both ``{transcript}`` and
+``{source_lang}`` placeholders.  The per-sample source language is
+read from the ``source_lang_key`` manifest key (default ``source_lang``)
+so the extraction LLM knows which language the transcript is in and
+preserves entity names in their original script.
+
 The extracted fields are written as a nested dict under the
 ``output_key`` manifest key (default: ``context_asr``).  On JSON parse
 failure the key is set to ``None`` and ``additional_notes`` is updated.
@@ -180,7 +186,15 @@ class ContextualASRExtractionStage(ProcessingStage[AudioTask, AudioTask]):
         model_id: HuggingFace model identifier for the text LLM.
         prompt_file: Path to the system+user prompt markdown file.
             Falls back to the bundled default if not set.
-        text_key: Input manifest key holding the transcript.
+        text_key: Input manifest key holding the transcript.  The
+            transcript value is bound to the ``{transcript}`` placeholder
+            in the user prompt template.
+        source_lang_key: Manifest key holding the source language (display
+            name or code) used to fill the ``{source_lang}`` placeholder
+            in the user prompt template.  Templates that don't reference
+            the placeholder still work — the value is simply unused.
+        default_source_lang: Fallback string used when ``source_lang_key``
+            is missing or empty on a sample.
         output_key: Output manifest key for the nested extraction dict.
         skip_me_key: Key used to check whether entry is flagged.
         additional_notes_key: Key to append parse-failure notes to.
@@ -197,6 +211,8 @@ class ContextualASRExtractionStage(ProcessingStage[AudioTask, AudioTask]):
     model_id: str = "Qwen/Qwen3.5-35B-A3B-FP8"
     prompt_file: str | None = None
     text_key: str = "pnc_text"
+    source_lang_key: str = "source_lang"
+    default_source_lang: str = "English"
     output_key: str = "context_asr"
     skip_me_key: str = "_skip_me"
     additional_notes_key: str = "additional_notes"
@@ -298,13 +314,23 @@ class ContextualASRExtractionStage(ProcessingStage[AudioTask, AudioTask]):
             self._sampling_params = None
 
     def inputs(self) -> tuple[list[str], list[str]]:
-        return [], [self.text_key, self.skip_me_key]
+        return [], [self.text_key, self.source_lang_key, self.skip_me_key]
 
     def outputs(self) -> tuple[list[str], list[str]]:
         return [], [self.output_key]
 
-    def _format_prompt(self, transcript: str) -> str:
-        user_content = self._user_prompt_template.format(transcript=transcript)
+    def _format_prompt(self, transcript: str, source_lang: str) -> str:
+        # The user template may reference {transcript}, {source_lang}, or
+        # both.  Only pass placeholders that actually appear so older
+        # prompt files (pre-source_lang) keep working unchanged.
+        fmt: dict[str, str] = {}
+        if "{transcript}" in self._user_prompt_template:
+            fmt["transcript"] = transcript
+        if "{source_lang}" in self._user_prompt_template:
+            fmt["source_lang"] = source_lang
+        user_content = (
+            self._user_prompt_template.format(**fmt) if fmt else self._user_prompt_template
+        )
         messages = [
             {"role": "system", "content": self._system_prompt},
             {"role": "user", "content": user_content},
@@ -347,8 +373,9 @@ class ContextualASRExtractionStage(ProcessingStage[AudioTask, AudioTask]):
                 task.data[self.output_key] = None
                 self._append_note(task, "context_asr: empty transcript")
                 continue
+            source_lang = task.data.get(self.source_lang_key) or self.default_source_lang
             valid_indices.append(i)
-            prompts.append(self._format_prompt(text.strip()))
+            prompts.append(self._format_prompt(text.strip(), str(source_lang)))
 
         if prompts:
             outputs = self._llm.generate(

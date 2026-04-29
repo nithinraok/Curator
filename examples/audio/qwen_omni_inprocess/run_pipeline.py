@@ -406,6 +406,7 @@ def main() -> None:  # noqa: C901
                 model_id=args.context_asr_model_id,
                 prompt_file=args.context_asr_prompt_file,
                 text_key=context_text_key,
+                source_lang_key=args.source_lang_key,
                 tensor_parallel_size=args.context_asr_tensor_parallel_size,
                 max_output_tokens=args.context_asr_max_output_tokens,
                 max_model_len=args.context_asr_max_model_len,
@@ -414,6 +415,7 @@ def main() -> None:  # noqa: C901
                 batch_size=args.context_asr_batch_size,
             ),
             ContextualASRPromptVariantStage(
+                source_lang_key=args.source_lang_key,
                 seed=args.context_asr_seed,
                 partial_keep_lo=args.context_asr_partial_keep_lo,
                 partial_keep_hi=args.context_asr_partial_keep_hi,

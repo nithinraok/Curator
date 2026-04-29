@@ -19,6 +19,15 @@ Reads the entity extraction dict produced by
 fields to it.  Each variant provides a different level of context
 information for training a context-biased ASR model.
 
+The stage is language-aware: when a per-sample source language is
+available under ``source_lang_key`` (default ``source_lang``), about half
+of the templates sampled per sample explicitly mention the language
+(e.g. ``"Transcribe the French audio …"``).  Templates that don't
+reference the language remain in the pool too, so the rendered prompts
+still vary in phrasing.  When the source-lang field is missing or
+empty, the stage falls back to the language-agnostic templates only,
+preserving back-compat with older manifests.
+
 This stage is deterministic — it uses a per-sample seeded RNG derived
 from ``sha256(seed + audio_filepath)`` so results are reproducible
 regardless of batch order, worker count, or shard layout.  The domain
@@ -113,6 +122,23 @@ CONTEXTLESS_TEMPLATES: list[str] = [
     "Transcribe the audio in lowercase only, no punctuation.",
 ]
 
+# Language-aware contextless templates — only used when a non-empty
+# language is provided to ``_pick_contextless``.  Mixed half-and-half
+# with the language-agnostic list above for prompt diversity.
+CONTEXTLESS_LANG_TEMPLATES: list[str] = [
+    "Transcribe the {language} audio.",
+    "Transcribe the {language} audio into text, ensuring all punctuation marks are included.",
+    "Listen to the {language} audio and produce an accurate transcript of what is spoken.",
+    "Produce a verbatim transcript of the {language} audio.",
+    "Transcribe this {language} audio. Include proper punctuation and capitalization.",
+    "Generate an accurate text transcript of the {language} speech in this recording.",
+    "You are a professional {language} transcriptionist. Transcribe the audio recording accurately.",
+    "Transcribe the {language} audio. Preserve filler words, repetitions, and false starts as spoken.",
+    "Transcribe the {language} audio. Remove filler words and produce a clean readable transcript.",
+    "Transcribe the {language} audio using spoken form: spell out numbers and abbreviations.",
+    "Transcribe the {language} audio using written form with digits, symbols, and standard abbreviations.",
+]
+
 COARSE_TEMPLATES: list[str] = [
     "This audio belongs to the {domain} field. Transcribe the audio into text, ensuring all punctuation marks are included.",
     "Domain: {domain}. Transcribe the audio accurately.",
@@ -131,6 +157,17 @@ COARSE_TEMPLATES: list[str] = [
     "Audio topic: {domain}. Provide the transcript.",
 ]
 
+# Language-aware coarse templates.
+COARSE_LANG_TEMPLATES: list[str] = [
+    "This {language} audio belongs to the {domain} field. Transcribe the audio into text, ensuring all punctuation marks are included.",
+    "Domain: {domain}. Transcribe the {language} audio accurately.",
+    "You are transcribing a {language} recording from the {domain} field. Pay attention to domain-specific terminology.",
+    "Topic: {domain}. Listen to the {language} audio and produce an accurate transcript.",
+    "The following {language} audio is from the {domain} domain. Please transcribe it.",
+    "Field: {domain} ({language}). Transcribe.",
+    "As an expert in {domain}, transcribe the following {language} audio. Use appropriate terminology for the field.",
+]
+
 FINE_TEMPLATES: list[str] = [
     "This audio belongs to the {domain} field and may contain the following words or phrases: {entities}. Transcribe the audio into text, ensuring all punctuation marks are included.",
     "Domain: {domain}. Key terms that may appear: {entities}. Transcribe the audio accurately.",
@@ -147,6 +184,17 @@ FINE_TEMPLATES: list[str] = [
     "Transcribe the audio below. The recording covers {domain}. Be especially careful with these terms, which may appear in the audio: {entities}.",
     "Field: {domain}. Vocabulary hints: {entities}. Transcribe.",
     "Topic: {domain}. Terms: {entities}. Write the transcript.",
+]
+
+# Language-aware fine templates.
+FINE_LANG_TEMPLATES: list[str] = [
+    "This {language} audio belongs to the {domain} field and may contain the following words or phrases: {entities}. Transcribe the audio into text, ensuring all punctuation marks are included.",
+    "Domain: {domain}. Key terms that may appear in the {language} audio: {entities}. Transcribe accurately.",
+    "This {language} recording is about {domain} and may include terms such as {entities}. Transcribe what you hear.",
+    "You are transcribing {language} audio about {domain}. Pay special attention to these terms if they appear: {entities}.",
+    "Transcribe this {language} audio. For reference, the topic is {domain} and the following terms may be mentioned: {entities}.",
+    "You are an expert {language} transcriptionist specializing in {domain}. The audio may contain the following specialized terms: {entities}.",
+    "Field: {domain} ({language}). Vocabulary hints: {entities}. Transcribe.",
 ]
 
 _ENTITY_STYLES: list[str] = ["comma", "and", "semicolon", "quoted", "numbered"]
@@ -178,19 +226,39 @@ def _format_entity_list(entities: list[str], style: str = "comma") -> str:
 #  Per-variant pickers
 # ─────────────────────────────────────────────────────────────
 
-def _pick_contextless(rng: _random_module.Random) -> str:
-    return rng.choice(CONTEXTLESS_TEMPLATES)
+def _pick_contextless(rng: _random_module.Random, language: str | None = None) -> str:
+    pool = CONTEXTLESS_TEMPLATES + (CONTEXTLESS_LANG_TEMPLATES if language else [])
+    template = rng.choice(pool)
+    return template.format(language=language) if "{language}" in template else template
 
 
-def _pick_coarse(domain: str, rng: _random_module.Random) -> str:
-    return rng.choice(COARSE_TEMPLATES).format(domain=domain)
+def _pick_coarse(
+    domain: str,
+    rng: _random_module.Random,
+    language: str | None = None,
+) -> str:
+    pool = COARSE_TEMPLATES + (COARSE_LANG_TEMPLATES if language else [])
+    template = rng.choice(pool)
+    fmt: dict[str, str] = {"domain": domain}
+    if language and "{language}" in template:
+        fmt["language"] = language
+    return template.format(**fmt)
 
 
-def _pick_fine(domain: str, entities: list[str], rng: _random_module.Random) -> str:
-    template = rng.choice(FINE_TEMPLATES)
+def _pick_fine(
+    domain: str,
+    entities: list[str],
+    rng: _random_module.Random,
+    language: str | None = None,
+) -> str:
+    pool = FINE_TEMPLATES + (FINE_LANG_TEMPLATES if language else [])
+    template = rng.choice(pool)
     style = rng.choice(_ENTITY_STYLES)
     entity_str = _format_entity_list(entities, style)
-    return template.format(domain=domain, entities=entity_str)
+    fmt: dict[str, str] = {"domain": domain, "entities": entity_str}
+    if language and "{language}" in template:
+        fmt["language"] = language
+    return template.format(**fmt)
 
 
 def _pick_distractor(
@@ -198,10 +266,11 @@ def _pick_distractor(
     fine_entities: list[str],
     distractors: list[str],
     rng: _random_module.Random,
+    language: str | None = None,
 ) -> str:
     combined = list(fine_entities) + list(distractors)
     rng.shuffle(combined)
-    return _pick_fine(domain, combined, rng)
+    return _pick_fine(domain, combined, rng, language=language)
 
 
 def _pick_partial(
@@ -210,21 +279,23 @@ def _pick_partial(
     rng: _random_module.Random,
     keep_lo: float = 0.5,
     keep_hi: float = 0.8,
+    language: str | None = None,
 ) -> str:
     frac = rng.uniform(keep_lo, keep_hi)
     k = max(1, int(len(entities) * frac))
     subset = rng.sample(entities, min(k, len(entities)))
-    return _pick_fine(domain, subset, rng)
+    return _pick_fine(domain, subset, rng, language=language)
 
 
 def _pick_negative(
     wrong_domain: str,
     entities: list[str] | None,
     rng: _random_module.Random,
+    language: str | None = None,
 ) -> str:
     if entities:
-        return _pick_fine(wrong_domain, entities, rng)
-    return _pick_coarse(wrong_domain, rng)
+        return _pick_fine(wrong_domain, entities, rng, language=language)
+    return _pick_coarse(wrong_domain, rng, language=language)
 
 
 def _render_all_variants(
@@ -234,25 +305,31 @@ def _render_all_variants(
     partial_keep_lo: float = 0.5,
     partial_keep_hi: float = 0.8,
     min_entities_for_partial: int = 3,
+    language: str | None = None,
 ) -> dict[str, str]:
     coarse_terms = extraction.get("coarse_context_terms") or []
     fine_terms = extraction.get("fine_context_terms") or []
     distractor_terms = extraction.get("distractor_terms") or []
     domain = coarse_terms[0] if coarse_terms else "General"
 
-    contextless_prompt = _pick_contextless(rng)
-    coarse_context_prompt = _pick_coarse(domain, rng)
+    contextless_prompt = _pick_contextless(rng, language=language)
+    coarse_context_prompt = _pick_coarse(domain, rng, language=language)
 
     fine_context_prompt = (
-        _pick_fine(domain, fine_terms, rng) if fine_terms else coarse_context_prompt
+        _pick_fine(domain, fine_terms, rng, language=language)
+        if fine_terms else coarse_context_prompt
     )
     distractor_prompt = (
-        _pick_distractor(domain, fine_terms, distractor_terms, rng)
+        _pick_distractor(domain, fine_terms, distractor_terms, rng, language=language)
         if fine_terms or distractor_terms
         else coarse_context_prompt
     )
     partial_context_prompt = (
-        _pick_partial(domain, fine_terms, rng, keep_lo=partial_keep_lo, keep_hi=partial_keep_hi)
+        _pick_partial(
+            domain, fine_terms, rng,
+            keep_lo=partial_keep_lo, keep_hi=partial_keep_hi,
+            language=language,
+        )
         if len(fine_terms) >= min_entities_for_partial
         else fine_context_prompt
     )
@@ -261,7 +338,9 @@ def _render_all_variants(
     other_domains = [d for d in domain_pool if d and d not in excluded]
     wrong_domain = rng.choice(other_domains) if other_domains else "Unrelated Topic"
     negative_entities = fine_terms[:3] if fine_terms else None
-    negative_context_prompt = _pick_negative(wrong_domain, negative_entities, rng)
+    negative_context_prompt = _pick_negative(
+        wrong_domain, negative_entities, rng, language=language,
+    )
 
     return {
         "contextless_prompt": contextless_prompt,
@@ -303,6 +382,11 @@ class ContextualASRPromptVariantStage(ProcessingStage[AudioTask, AudioTask]):
             seed.  Must be a stable identifier (e.g. ``audio_filepath``)
             so that outputs are deterministic regardless of batch order,
             worker count, or shard layout.
+        source_lang_key: Manifest key holding the per-sample source
+            language (display name or code).  When present and non-empty
+            the stage mixes language-aware templates into the sampling
+            pool.  When missing or empty, the stage falls back to the
+            language-agnostic templates only.
         seed: Base RNG seed combined with the sample id hash.
         partial_keep_lo: Lower bound of the random keep fraction for the
             partial-context variant (default 0.5).
@@ -319,6 +403,7 @@ class ContextualASRPromptVariantStage(ProcessingStage[AudioTask, AudioTask]):
     name: str = "ContextualASRPromptVariant"
     context_key: str = "context_asr"
     sample_id_key: str = "audio_filepath"
+    source_lang_key: str = "source_lang"
     seed: int = 42
     partial_keep_lo: float = 0.5
     partial_keep_hi: float = 0.8
@@ -336,7 +421,7 @@ class ContextualASRPromptVariantStage(ProcessingStage[AudioTask, AudioTask]):
         pass
 
     def inputs(self) -> tuple[list[str], list[str]]:
-        return [], [self.context_key]
+        return [], [self.context_key, self.source_lang_key]
 
     def outputs(self) -> tuple[list[str], list[str]]:
         return [], [self.context_key]
@@ -358,6 +443,8 @@ class ContextualASRPromptVariantStage(ProcessingStage[AudioTask, AudioTask]):
             if not isinstance(extraction, dict):
                 continue
 
+            language = task.data.get(self.source_lang_key) or None
+            language = str(language) if language else None
             rng = _random_module.Random(self._sample_seed(task))
             variants = _render_all_variants(
                 extraction,
@@ -366,6 +453,7 @@ class ContextualASRPromptVariantStage(ProcessingStage[AudioTask, AudioTask]):
                 partial_keep_lo=self.partial_keep_lo,
                 partial_keep_hi=self.partial_keep_hi,
                 min_entities_for_partial=self.min_entities_for_partial,
+                language=language,
             )
             extraction.update(variants)
 
