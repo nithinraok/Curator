@@ -24,6 +24,8 @@ All stages use the same model ID but load independently per actor.
 Architecture:
     ALMManifestReader (CPU)
         → reads per-shard JSONL output from the ASR pipeline
+    [if --sortformer_model] InferenceSortformerStage (GPU, fractional)
+        → speaker diarization on audio_filepath, writes num_speakers
     [if --enable_pnc] TextLLMStage: PnC (GPU)
         → restores punctuation/capitalisation, writes pnc_text
     [if --enable_language_id] TextLLMStage: LanguageID (GPU)
@@ -80,11 +82,12 @@ from loguru import logger
 from nemo_curator.pipeline import Pipeline
 from nemo_curator.stages.audio.alm.alm_manifest_reader import ALMManifestReader
 from nemo_curator.stages.audio.alm.sharded_manifest_writer import ShardedManifestWriterStage
+from nemo_curator.stages.audio.inference.sortformer import InferenceSortformerStage
 from nemo_curator.stages.audio.text_filtering.acoustic_distractor import AcousticDistractorStage
 from nemo_curator.stages.audio.text_filtering.contextual_asr_extraction import ContextualASRExtractionStage
 from nemo_curator.stages.audio.text_filtering.contextual_asr_prompt_variant import ContextualASRPromptVariantStage
-from nemo_curator.stages.audio.text_filtering.llm_language_verification import LLMLanguageVerificationStage
 from nemo_curator.stages.audio.text_filtering.instruction_packer import InstructionPackerStage
+from nemo_curator.stages.audio.text_filtering.llm_language_verification import LLMLanguageVerificationStage
 from nemo_curator.stages.audio.text_filtering.text_llm_stage import TextLLMStage
 from nemo_curator.stages.resources import Resources
 
@@ -208,6 +211,20 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=42,
         help="Base RNG seed for per-sample prompt-template sampling in the instruction packer.",
+    )
+
+    diar = ap.add_argument_group("Sortformer speaker diarization")
+    diar.add_argument(
+        "--sortformer_model",
+        type=str,
+        default=None,
+        help="Sortformer HF model id or local .nemo path. If set, enables diarization after manifest reading.",
+    )
+    diar.add_argument(
+        "--sortformer_gpu_memory_gb",
+        type=float,
+        default=8.0,
+        help="GPU memory (GB) reserved for each Sortformer actor.",
     )
 
     ap.add_argument("--text_key", type=str, default="pnc_text", help="Input text field from ASR pipeline output.")
@@ -384,7 +401,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     return ap
 
 
-def main() -> None:  # noqa: C901, PLR0915
+def main() -> None:  # noqa: C901, PLR0912, PLR0915
     args = _build_arg_parser().parse_args()
 
     if (
@@ -396,10 +413,12 @@ def main() -> None:  # noqa: C901, PLR0915
         and not args.enable_context_asr
         and not args.enable_code_switching
         and not args.enable_speech_qa
+        and not args.sortformer_model
     ):
         logger.warning(
             "No stages enabled. Use --enable_pnc, --enable_language_id, --enable_itn, --enable_itn_no-disfluencies, "
-            "--enable_captioning, --enable_context_asr, --enable_code_switching, or --enable_speech_qa."
+            "--enable_captioning, --enable_context_asr, --enable_code_switching, --enable_speech_qa, "
+            "or --sortformer_model."
         )
         return
 
@@ -427,6 +446,16 @@ def main() -> None:  # noqa: C901, PLR0915
     stages = [
         ALMManifestReader(manifest_path=args.input_manifest, output_dir=args.output_dir),
     ]
+
+    if args.sortformer_model:
+        stages.append(
+            InferenceSortformerStage(
+                model_name=args.sortformer_model,
+                store_segments=False,
+                resources=Resources(gpu_memory_gb=args.sortformer_gpu_memory_gb),
+            )
+        )
+        logger.info(f"Sortformer diarization enabled: {args.sortformer_model} → num_speakers")
 
     if args.enable_pnc:
         pnc_input_key = "abbreviated_text" if args.text_key == "pnc_text" else args.text_key
