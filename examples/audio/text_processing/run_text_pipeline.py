@@ -26,6 +26,9 @@ Architecture:
         → reads per-shard JSONL output from the ASR pipeline
     [if --enable_pnc] TextLLMStage: PnC (GPU)
         → restores punctuation/capitalisation, writes pnc_text
+    [if --enable_tn] TextLLMStage: TN (GPU)
+        → text normalization (written→spoken), preserves disfluencies
+        → writes tn_text
     [if --enable_language_id] TextLLMStage: LanguageID (GPU)
         → asks the LLM for the primary language plus all languages present
         → writes llm_language_prediction
@@ -97,6 +100,7 @@ _PROMPT_DIR = (
     / "prompts"
 )
 _ITN_PROMPT = _PROMPT_DIR / "itn_prompt.md"
+_TN_PROMPT = _PROMPT_DIR / "tn_prompt.md"
 _CORRECTION_PROMPT = _PROMPT_DIR / "correction_prompt.md"
 _CAPTIONING_PROMPT = _PROMPT_DIR / "captioning_prompt.md"
 _PNC_PROMPT = _PROMPT_DIR / "pnc_prompt.md"
@@ -121,6 +125,26 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     ap.add_argument("--output_dir", type=str, required=True, help="Output directory for processed manifests.")
 
+    ap.add_argument(
+        "--enable_tn",
+        action="store_true",
+        default=False,
+        help=(
+            "Enable TN stage: written→spoken form (digits/symbols to number words), "
+            "preserves disfluencies and all non-normalization wording. Output key: tn_text"
+        ),
+    )
+    ap.add_argument(
+        "--disable_tn_validation",
+        action="store_true",
+        default=False,
+        help=(
+            "Disable TN output validation. By default the TN stage validates each "
+            "output (validation_mode='tn'): it reverts to the input when the LLM "
+            "translates to English or transliterates to another script instead of "
+            "normalizing. Number expansion (word-count increase) is NOT penalized."
+        ),
+    )
     ap.add_argument(
         "--enable_itn",
         action="store_true",
@@ -211,6 +235,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
 
     ap.add_argument("--text_key", type=str, default="pnc_text", help="Input text field from ASR pipeline output.")
+    ap.add_argument("--tn_output_key", type=str, default="tn_text", help="Output field for TN result.")
     ap.add_argument("--itn_output_key", type=str, default="itn_text", help="Output field for ITN result.")
     ap.add_argument(
         "--itn_no_disfluencies_output_key",
@@ -237,6 +262,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
     ap.add_argument(
         "--model_id", type=str, default="Qwen/Qwen3.5-35B-A3B-FP8", help="HuggingFace model ID for the text LLM."
+    )
+    ap.add_argument(
+        "--tn_prompt_file", type=str, default=None, help="Path to TN prompt file. Defaults to bundled tn_prompt.md."
     )
     ap.add_argument(
         "--itn_prompt_file", type=str, default=None, help="Path to ITN prompt file. Defaults to bundled itn_prompt.md."
@@ -388,7 +416,8 @@ def main() -> None:  # noqa: C901, PLR0915
     args = _build_arg_parser().parse_args()
 
     if (
-        not args.enable_itn
+        not args.enable_tn
+        and not args.enable_itn
         and not args.enable_itn_no_disfluencies
         and not args.enable_captioning
         and not args.enable_pnc
@@ -398,11 +427,13 @@ def main() -> None:  # noqa: C901, PLR0915
         and not args.enable_speech_qa
     ):
         logger.warning(
-            "No stages enabled. Use --enable_pnc, --enable_language_id, --enable_itn, --enable_itn_no-disfluencies, "
-            "--enable_captioning, --enable_context_asr, --enable_code_switching, or --enable_speech_qa."
+            "No stages enabled. Use --enable_pnc, --enable_tn, --enable_language_id, --enable_itn, "
+            "--enable_itn_no-disfluencies, --enable_captioning, --enable_context_asr, --enable_code_switching, "
+            "or --enable_speech_qa."
         )
         return
 
+    tn_prompt = args.tn_prompt_file or str(_TN_PROMPT)
     itn_prompt = args.itn_prompt_file or str(_ITN_PROMPT)
     itn_no_disfl_prompt = args.itn_no_disfluencies_prompt_file or str(_CORRECTION_PROMPT)
     captioning_prompt = args.captioning_prompt_file or str(_CAPTIONING_PROMPT)
@@ -441,6 +472,26 @@ def main() -> None:  # noqa: C901, PLR0915
             )
         )
         logger.info(f"PnC stage enabled: {pnc_input_key} → {args.pnc_output_key}")
+
+    if args.enable_tn:
+        stages.append(
+            TextLLMStage(
+                name="TextNormalization",
+                prompt_file=tn_prompt,
+                text_key=args.text_key,
+                output_text_key=args.tn_output_key,
+                enable_validation=not args.disable_tn_validation,
+                validation_mode="tn",
+                resources=Resources(gpus=1.0),
+                **shared_model_kwargs,
+            )
+        )
+        logger.info(
+            "TN stage enabled: %s → %s (validation=%s, mode=tn)",
+            args.text_key,
+            args.tn_output_key,
+            not args.disable_tn_validation,
+        )
 
     if args.enable_language_id:
         stages.append(
