@@ -28,7 +28,9 @@ Decomposes into:
 
 from __future__ import annotations
 
+import json
 import os
+import tempfile
 from dataclasses import dataclass
 from typing import Any
 
@@ -304,6 +306,40 @@ class NeMoSpeechReaderStage(ProcessingStage[FileGroupTask, AudioTask]):
         }
 
     @staticmethod
+    def _strip_skipme_manifest(manifest_path: str) -> str | None:
+        """Write a temp manifest with _skipme cleared; return temp path or None if unneeded.
+
+        NeMo's LazyNeMoTarredIterator silently drops every entry where _skipme is
+        truthy (their line: `if data.get("_skipme", False): continue`).
+        Granary-v1 sets _skipme=1 on rejected entries that Granary-v2 needs to
+        re-evaluate, so we clear the field before NeMo sees it.
+        InitializeFieldsStage archives the original value to additional_notes["v1_skipme"].
+        """
+        try:
+            with open(manifest_path, encoding="utf-8") as f:
+                lines = [l for l in f if l.strip()]  # noqa: E741
+        except OSError:
+            return None
+
+        if not any(json.loads(l).get("_skipme") for l in lines):
+            return None  # no _skipme entries — no temp file needed
+
+        tmp = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", delete=False, encoding="utf-8"
+        )
+        try:
+            for line in lines:
+                entry = json.loads(line)
+                entry.pop("_skipme", None)
+                tmp.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            tmp.close()
+            return tmp.name
+        except Exception:
+            tmp.close()
+            os.unlink(tmp.name)
+            raise
+
+    @staticmethod
     def _make_cutset(manifest_path: str, tar_path: str | None) -> Any:  # noqa: ANN401
         """Build a lhotse CutSet using NeMo adapters."""
         from lhotse import CutSet
@@ -313,7 +349,7 @@ class NeMoSpeechReaderStage(ProcessingStage[FileGroupTask, AudioTask]):
             iterator = LazyNeMoTarredIterator(
                 manifest_path=manifest_path,
                 tar_paths=tar_path,
-                skip_missing_manifest_entries=True,
+                skip_missing_manifest_entries=False,
             )
             return CutSet(iterator)
 
@@ -380,54 +416,64 @@ class NeMoSpeechReaderStage(ProcessingStage[FileGroupTask, AudioTask]):
         manifest_path = task.data[0]
         tar_path = task.data[1] if len(task.data) >= 2 else None  # noqa: PLR2004
 
-        cutset = self._make_cutset(manifest_path, tar_path)
+        tmp_manifest = self._strip_skipme_manifest(manifest_path) if tar_path else None
+        effective_manifest = tmp_manifest or manifest_path
+
+        cutset = self._make_cutset(effective_manifest, tar_path)
 
         mode = "tarred" if tar_path else "non-tarred"
         logger.info(f"Reading shard {shard_key} via NeMo {mode} adapter")
 
         results: list[AudioTask] = []
         loaded = 0
-        for cut in cutset:
-            try:
-                audio = cut.load_audio().squeeze()
-            except Exception:  # noqa: BLE001
-                logger.warning(f"Skipping unreadable audio: {cut.id}")
-                continue
+        try:
+            for cut in cutset:
+                try:
+                    audio = cut.load_audio().squeeze()
+                except Exception:  # noqa: BLE001
+                    logger.warning(f"Skipping unreadable audio: {cut.id}")
+                    continue
 
-            if audio.ndim > 1:
-                audio = audio.mean(axis=0)
+                if audio.ndim > 1:
+                    audio = audio.mean(axis=0)
 
-            target_sr = cut.recording.sampling_rate
-            if cut.duration > 0:
-                actual_sr = round(len(audio) / cut.duration)
-                if actual_sr != target_sr and actual_sr > 0:
-                    import librosa
-                    audio = librosa.resample(audio, orig_sr=actual_sr, target_sr=target_sr)
+                target_sr = cut.recording.sampling_rate
+                if cut.duration > 0:
+                    actual_sr = round(len(audio) / cut.duration)
+                    if actual_sr != target_sr and actual_sr > 0:
+                        import librosa
+                        audio = librosa.resample(audio, orig_sr=actual_sr, target_sr=target_sr)
 
-            loaded += 1
-            if loaded % 100 == 0 or loaded == 1:
-                logger.info(f"  [{shard_key}] loaded {loaded}")
+                loaded += 1
+                if loaded % 100 == 0 or loaded == 1:
+                    logger.info(f"  [{shard_key}] loaded {loaded}")
 
-            entry_data = dict(cut.custom) if cut.custom else {}
-            entry_data["waveform"] = audio.astype(np.float32)
-            entry_data["sampling_rate"] = target_sr
-            entry_data["sample_rate"] = target_sr
-            entry_data["duration"] = cut.duration
-            entry_data["num_channels"] = 1
-            entry_data["corpus"] = corpus
-            if "audio_filepath" not in entry_data and cut.recording and cut.recording.sources:
-                src = cut.recording.sources[0].source
-                entry_data["audio_filepath"] = src if isinstance(src, str) else cut.id
-            if language and "source_lang" not in entry_data:
-                entry_data["source_lang"] = language
+                entry_data = dict(cut.custom) if cut.custom else {}
+                entry_data["waveform"] = audio.astype(np.float32)
+                entry_data["sampling_rate"] = target_sr
+                entry_data["sample_rate"] = target_sr
+                entry_data["duration"] = cut.duration
+                entry_data["num_channels"] = 1
+                entry_data["corpus"] = corpus
+                if "audio_filepath" not in entry_data and cut.recording and cut.recording.sources:
+                    src = cut.recording.sources[0].source
+                    entry_data["audio_filepath"] = src if isinstance(src, str) else cut.id
+                if language and "source_lang" not in entry_data:
+                    entry_data["source_lang"] = language
 
-            results.append(AudioTask(
-                task_id=f"{shard_key}_{cut.id}",
-                dataset_name=corpus,
-                data=entry_data,
-                _metadata={**metadata, "_shard_key": shard_key},
-                _stage_perf=list(task._stage_perf),
-            ))
+                results.append(AudioTask(
+                    task_id=f"{shard_key}_{cut.id}",
+                    dataset_name=corpus,
+                    data=entry_data,
+                    _metadata={**metadata, "_shard_key": shard_key},
+                    _stage_perf=list(task._stage_perf),
+                ))
+        finally:
+            if tmp_manifest:
+                try:
+                    os.unlink(tmp_manifest)
+                except OSError:
+                    pass
 
         for r in results:
             r._metadata["_shard_total"] = len(results)
