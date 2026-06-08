@@ -2,7 +2,7 @@
 
 Convert the written-form transcript below in **{language}** to spoken form. **Only** apply conversions from the table (numbers, dates, times, money, units, symbols, etc.). Use **{language}** conventions; English examples show the pattern.
 
-Return ONLY the converted text. No explanations or extra formatting.
+Return ONLY normalized text. No explanations or extra formatting.
 
 ## Constraints
 
