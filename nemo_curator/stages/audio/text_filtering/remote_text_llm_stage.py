@@ -44,6 +44,7 @@ from nemo_curator.stages.resources import Resources
 
 if TYPE_CHECKING:
     from nemo_curator.backends.base import WorkerMetadata
+    from nemo_curator.models.client.openai_client import QueueBackpressureConfig
     from nemo_curator.tasks import AudioTask
 
 
@@ -72,6 +73,7 @@ class RemoteTextLLMStage(TextLLMStage):
     served_model_name: str | None = None
     max_concurrent_requests: int = 64
     request_timeout: int = 120
+    queue_backpressure: QueueBackpressureConfig | None = None
 
     _client: Any = field(default=None, init=False, repr=False)
     _gen_config: Any = field(default=None, init=False, repr=False)
@@ -103,6 +105,7 @@ class RemoteTextLLMStage(TextLLMStage):
             base_url=self.inference_base_url,
             api_key=self.inference_api_key,
             timeout=self.request_timeout,
+            queue_backpressure=self.queue_backpressure,
         )
         self._client.setup()
         # One event loop for this actor's lifetime so the async client (and its
@@ -116,8 +119,8 @@ class RemoteTextLLMStage(TextLLMStage):
         # the OpenAI SDK extra_body so the server disables thinking exactly as
         # the local apply_chat_template call does.
         self._gen_config = GenerationConfig(
-            temperature=0.0,
-            top_p=1.0,
+            temperature=self.temperature,
+            top_p=self.top_p,
             max_tokens=self.max_output_tokens,
             seed=0,
             extra_kwargs={"extra_body": {"chat_template_kwargs": {"enable_thinking": False}}},
@@ -185,7 +188,7 @@ class RemoteTextLLMStage(TextLLMStage):
                 model=model,
                 generation_config=self._gen_config,
             )
-            return ((resp[0] if resp else None) or "").strip()   # server can return [None] for empty completions
+            return ((resp[0] if resp else None) or "").strip()  # server can return [None] for empty completions
 
         async def _all() -> list[str]:
             return await asyncio.gather(*[_one(m) for m in messages_list])

@@ -86,23 +86,22 @@ from pathlib import Path
 
 from loguru import logger
 
+from nemo_curator.models.client.openai_client import QueueBackpressureConfig
 from nemo_curator.pipeline import Pipeline
 from nemo_curator.stages.audio.alm.alm_manifest_reader import ALMManifestReader
 from nemo_curator.stages.audio.alm.sharded_manifest_writer import ShardedManifestWriterStage
 from nemo_curator.stages.audio.text_filtering.acoustic_distractor import AcousticDistractorStage
 from nemo_curator.stages.audio.text_filtering.contextual_asr_extraction import ContextualASRExtractionStage
 from nemo_curator.stages.audio.text_filtering.contextual_asr_prompt_variant import ContextualASRPromptVariantStage
+from nemo_curator.stages.audio.text_filtering.fused_remote_text_llm_stage import FusedRemoteTextLLMStage
 from nemo_curator.stages.audio.text_filtering.instruction_packer import InstructionPackerStage
 from nemo_curator.stages.audio.text_filtering.llm_language_verification import LLMLanguageVerificationStage
 from nemo_curator.stages.audio.text_filtering.remote_contextual_asr_extraction import (
     RemoteContextualASRExtractionStage,
 )
-from nemo_curator.stages.audio.text_filtering.fused_remote_text_llm_stage import FusedRemoteTextLLMStage
 from nemo_curator.stages.audio.text_filtering.remote_recover_entities import RemoteRecoverEntitiesStage
 from nemo_curator.stages.audio.text_filtering.remote_text_llm_stage import RemoteTextLLMStage
 from nemo_curator.stages.audio.text_filtering.text_llm_stage import TextLLMStage
-from nemo_curator.stages.resources import Resources
-
 
 _PROMPT_DIR = (
     Path(__file__).resolve().parent.parent.parent.parent
@@ -126,6 +125,19 @@ _CODE_SWITCHING_PROMPT = _PROMPT_DIR / "code_switching_prompt.md"
 _SPEECH_QA_PROMPT = _PROMPT_DIR / "speech_qa_prompt.md"
 _LANGUAGE_ID_PROMPT = _PROMPT_DIR / "language_id_prompt.md"
 _RECOVER_ENTITIES_PROMPT = _PROMPT_DIR / "recover_entities_prompt.md"
+
+
+def _json_object(value: str) -> dict:
+    """Argparse converter for vLLM JSON-object flags."""
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as exc:
+        msg = f"Expected a JSON object, got invalid JSON: {exc}"
+        raise argparse.ArgumentTypeError(msg) from exc
+    if not isinstance(parsed, dict):
+        msg = f"Expected a JSON object, got {type(parsed).__name__}"
+        raise argparse.ArgumentTypeError(msg)
+    return parsed
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
@@ -541,6 +553,43 @@ def _build_arg_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
     )
     ap.add_argument("--max_num_seqs", type=int, default=256)
     ap.add_argument("--max_output_tokens", type=int, default=512)
+    ap.add_argument(
+        "--temperature",
+        type=float,
+        default=0.0,
+        help="Sampling temperature for the generic text stages (default: deterministic 0.0).",
+    )
+    ap.add_argument(
+        "--top_p",
+        type=float,
+        default=1.0,
+        help="Nucleus-sampling probability for the generic text stages (default: 1.0).",
+    )
+    ap.add_argument(
+        "--speculative_config",
+        type=_json_object,
+        default=None,
+        help=(
+            "JSON object forwarded to vLLM --speculative-config, for example "
+            '\'{"method":"mtp","model":"google/gemma-4-31B-it-assistant","num_speculative_tokens":4}\'.'
+        ),
+    )
+    ap.add_argument(
+        "--max_parallel_loading_workers",
+        type=int,
+        default=None,
+        help="vLLM max_parallel_loading_workers (None = vLLM default).",
+    )
+    ap.add_argument(
+        "--reuse_current_dynamo_environment",
+        action="store_true",
+        help=(
+            "Skip Ray's isolated ai-dynamo[vllm] runtime-environment install and use the current "
+            "container Python environment. The image must already contain compatible Dynamo, vLLM, "
+            "and Ray packages. Useful for prebuilt production images and network filesystems where "
+            "cloning the full driver virtualenv is prohibitively slow."
+        ),
+    )
     ap.add_argument("--gpu_memory_utilization", type=float, default=0.95)
     ap.add_argument("--kv_cache_dtype", type=str, default="fp8")
     ap.add_argument("--num_workers", type=int, default=None, help="Explicit GPU worker count for Xenna.")
@@ -608,6 +657,54 @@ def _build_arg_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
         help="Max in-flight requests per stage actor (async client semaphore bound).",
     )
     srv.add_argument("--inference_request_timeout", type=int, default=120, help="Per-request timeout (seconds).")
+    srv.add_argument(
+        "--inference_queue_max_waiting_requests",
+        type=int,
+        default=None,
+        help=(
+            "Enable Prometheus-driven client backpressure and pause new requests while the configured "
+            "queue metric is at or above this value. None disables the queue gate."
+        ),
+    )
+    srv.add_argument(
+        "--inference_queue_poll_interval_seconds",
+        type=float,
+        default=0.25,
+        help="Queue-backpressure polling interval (default: 0.25).",
+    )
+    srv.add_argument(
+        "--inference_queue_stale_after_seconds",
+        type=float,
+        default=2.0,
+        help="Seconds to cache a queue-metric reading (default: 2.0).",
+    )
+    srv.add_argument(
+        "--inference_queue_retry_after_seconds",
+        type=float,
+        default=None,
+        help="Optional fixed delay while backpressured; defaults to the polling interval.",
+    )
+    srv.add_argument(
+        "--inference_queue_metric_name",
+        type=str,
+        default="vllm:num_requests_waiting",
+        help="Prometheus metric used for queue backpressure.",
+    )
+    srv.add_argument(
+        "--inference_queue_metrics_url",
+        type=str,
+        default=None,
+        help=(
+            "Prometheus endpoint exporting --inference_queue_metric_name. This is required when the "
+            "pipeline starts local Dynamo because the OpenAI frontend does not aggregate the worker's "
+            "vLLM metrics (the default single-worker endpoint is http://<worker-host>:8081/metrics)."
+        ),
+    )
+    srv.add_argument(
+        "--inference_queue_fail_closed",
+        action="store_true",
+        help="Fail requests when queue metrics are unavailable. Default is fail-open.",
+    )
     srv.add_argument(
         "--inference_health_timeout",
         type=int,
@@ -722,6 +819,31 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
         msg = "--enable_recover_entities requires --use_inference_server (RecoverEntities runs on the Dynamo server)."
         raise ValueError(msg)
 
+    if args.inference_queue_max_waiting_requests is not None:
+        if not args.use_inference_server:
+            msg = "--inference_queue_max_waiting_requests requires --use_inference_server."
+            raise ValueError(msg)
+        if not args.inference_queue_metrics_url:
+            msg = (
+                "--inference_queue_metrics_url is required with local Dynamo queue backpressure. "
+                "The Dynamo OpenAI frontend does not export the worker's vllm:num_requests_waiting metric; "
+                "point this option at the vLLM worker /metrics endpoint (normally "
+                "http://<worker-host>:8081/metrics for one local worker)."
+            )
+            raise ValueError(msg)
+
+    queue_backpressure = None
+    if args.inference_queue_max_waiting_requests is not None:
+        queue_backpressure = QueueBackpressureConfig(
+            max_waiting_requests=args.inference_queue_max_waiting_requests,
+            poll_interval_seconds=args.inference_queue_poll_interval_seconds,
+            stale_after_seconds=args.inference_queue_stale_after_seconds,
+            retry_after_seconds=args.inference_queue_retry_after_seconds,
+            metric_name=args.inference_queue_metric_name,
+            fail_open=not args.inference_queue_fail_closed,
+            metrics_url=args.inference_queue_metrics_url,
+        )
+
     # ── Optional Dynamo inference server ─────────────────────────────
     # Two modes:
     #   --use_inference_server -> start a local RayClient + NVIDIA Dynamo server
@@ -770,6 +892,10 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
             engine_kwargs["compilation_config"] = {"cache_dir": _compile_cache}
         if args.max_num_batched_tokens is not None:
             engine_kwargs["max_num_batched_tokens"] = args.max_num_batched_tokens
+        if args.speculative_config is not None:
+            engine_kwargs["speculative_config"] = args.speculative_config
+        if args.max_parallel_loading_workers is not None:
+            engine_kwargs["max_parallel_loading_workers"] = args.max_parallel_loading_workers
         if args.language_model_only:
             # gemma-4 is multimodal; we only send text. LM-only skips the vision/audio towers
             # -> lighter, faster, stable load + no --disable_chunked_mm_input / mm-token constraint.
@@ -789,6 +915,7 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
             model_identifier=args.model_id,
             model_name=args.inference_served_model_name,
             engine_kwargs=engine_kwargs,
+            install_runtime_dependencies=not args.reuse_current_dynamo_environment,
             num_replicas=args.inference_max_replicas,
         )
         backend_cfg = DynamoServerConfig()
@@ -813,6 +940,7 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
             "inference_api_key": args.inference_api_key,
             "max_concurrent_requests": args.inference_max_concurrent_requests,
             "request_timeout": args.inference_request_timeout,
+            "queue_backpressure": queue_backpressure,
         }
         logger.info(f"Routing LLM stages to remote inference server at {remote_base_url} (model={remote_model_name})")
     # Pick in-process vs remote stage classes. The Remote* classes subclass
@@ -837,6 +965,8 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
         "max_model_len": args.max_model_len,
         "max_num_seqs": args.max_num_seqs,
         "max_output_tokens": args.max_output_tokens,
+        "temperature": args.temperature,
+        "top_p": args.top_p,
         "gpu_memory_utilization": args.gpu_memory_utilization,
         "kv_cache_dtype": args.kv_cache_dtype,
         "num_workers_override": args.num_workers,
@@ -1072,12 +1202,17 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
                 max_num_seqs=args.max_num_seqs,
                 gpu_memory_utilization=args.gpu_memory_utilization,
                 kv_cache_dtype=args.kv_cache_dtype,
-                num_workers_override=args.context_asr_num_workers if args.context_asr_num_workers is not None else args.num_workers,
+                num_workers_override=args.context_asr_num_workers
+                if args.context_asr_num_workers is not None
+                else args.num_workers,
                 batch_size=args.batch_size,
                 **{
                     **remote_kwargs,
-                    **({"max_concurrent_requests": args.context_asr_max_concurrent_requests}
-                       if args.context_asr_max_concurrent_requests is not None and remote_kwargs else {}),
+                    **(
+                        {"max_concurrent_requests": args.context_asr_max_concurrent_requests}
+                        if args.context_asr_max_concurrent_requests is not None and remote_kwargs
+                        else {}
+                    ),
                 },
             )
         )
@@ -1162,6 +1297,7 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
                 served_model_name=remote_model_name,
                 max_concurrent_requests=args.inference_max_concurrent_requests,
                 request_timeout=args.inference_request_timeout,
+                queue_backpressure=queue_backpressure,
                 batch_size=args.batch_size,
             )
         )
@@ -1218,8 +1354,7 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
             except Exception:
                 failed_batches += 1
                 logger.exception(
-                    f"Batch {_bi + 1}/{len(shard_batches)} failed; continuing "
-                    "(incomplete shards resume on re-run)."
+                    f"Batch {_bi + 1}/{len(shard_batches)} failed; continuing (incomplete shards resume on re-run)."
                 )
                 continue
             # Batch drained cleanly → finalize .done deterministically for its shards.

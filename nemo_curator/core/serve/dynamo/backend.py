@@ -147,8 +147,10 @@ class DynamoBackend(InferenceBackend):
 
             # Materialize the actor-venv override file on every node before
             # any worker with DYNAMO_VLLM_RUNTIME_ENV is spawned; uv reads the
-            # path from the node where the runtime_env install runs.
-            ensure_actor_overrides_on_all_nodes(ignore_head_node=ignore_ray_head_node())
+            # path from the node where the runtime_env install runs. A prebuilt
+            # container may explicitly reuse its current environment instead.
+            if any(model.install_runtime_dependencies for model in self._models):
+                ensure_actor_overrides_on_all_nodes(ignore_head_node=ignore_ray_head_node())
 
             self._sweep_orphan_actors()
             remove_named_pgs_with_prefix(self._pg_name_prefix)
@@ -210,6 +212,18 @@ class DynamoBackend(InferenceBackend):
 
         base_env = {"ETCD_ENDPOINTS": etcd_endpoint, "NATS_SERVER": nats_url}
 
+        # The Dynamo frontend and vLLM worker both start a system-status
+        # server. Workers intentionally retain DYN_SYSTEM_PORT (8081 by
+        # default) because that endpoint exports vLLM queue metrics. Give the
+        # frontend a separate free port so it cannot steal the worker metrics
+        # endpoint before the model process starts.
+        worker_system_port = int(os.environ.get("DYN_SYSTEM_PORT", "8081"))
+        frontend_system_port = get_free_port_in_bundle(
+            self._infra_pg,
+            INFRA_FRONTEND_BUNDLE,
+            worker_system_port + 1,
+        )
+
         effective_router_mode, effective_router_kv_events = self._resolve_effective_router(
             self._models, backend_cfg.router
         )
@@ -269,6 +283,7 @@ class DynamoBackend(InferenceBackend):
             server.port,
             base_env,
             backend_cfg=backend_cfg,
+            system_port=frontend_system_port,
             effective_router_mode=effective_router_mode,
             effective_router_kv_events=effective_router_kv_events,
             runtime_env=merge_model_runtime_envs(self._models),
@@ -446,6 +461,7 @@ class DynamoBackend(InferenceBackend):
         base_env: dict[str, str],
         *,
         backend_cfg: DynamoServerConfig,
+        system_port: int | None = None,
         effective_router_mode: str | None = None,
         effective_router_kv_events: bool | None = None,
         runtime_env: dict[str, Any] | None = None,
@@ -463,6 +479,8 @@ class DynamoBackend(InferenceBackend):
         ``None`` the corresponding typed ``router`` field is used verbatim.
         """
         frontend_env = dict(base_env)
+        if system_port is not None:
+            frontend_env["DYN_SYSTEM_PORT"] = str(system_port)
         router = backend_cfg.router
         router_mode = effective_router_mode if effective_router_mode is not None else router.mode
         router_kv_events = effective_router_kv_events if effective_router_kv_events is not None else router.kv_events

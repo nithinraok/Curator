@@ -273,6 +273,16 @@ class TestDynamoBackendLaunchFrontend:
         ]
         assert captured_spawn[0]["subprocess_env"] == {}
 
+    def test_frontend_system_port_does_not_collide_with_worker_metrics(
+        self, captured_spawn: list[dict[str, Any]]
+    ) -> None:
+        backend_cfg = DynamoServerConfig()
+        backend = self._make_backend(backend_cfg)
+
+        backend._launch_frontend(port=9999, base_env={}, backend_cfg=backend_cfg, system_port=8082)
+
+        assert captured_spawn[0]["subprocess_env"] == {"DYN_SYSTEM_PORT": "8082"}
+
     def test_kv_mode_without_events_emits_no_router_kv_events(self, captured_spawn: list[dict[str, Any]]) -> None:
         backend_cfg = DynamoServerConfig(router=DynamoRouterConfig(mode="kv", kv_events=False))
         backend = self._make_backend(backend_cfg)

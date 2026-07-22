@@ -82,6 +82,7 @@ class DynamoVLLMModelConfig(BaseModelConfig):
     """
 
     engine_kwargs: dict[str, Any] = field(default_factory=dict)
+    install_runtime_dependencies: bool = True
     num_replicas: int = 1
     mode: Literal["aggregated", "disagg"] = "aggregated"
     prefill: DynamoRoleConfig | None = None

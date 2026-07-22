@@ -72,6 +72,22 @@ def test_dynamo_endpoint(namespace: str, component: str, role: str | None, expec
             {"generation_config": {"temperature": 0.7}},
             ["--generation-config", '{"temperature": 0.7}'],
         ),
+        (
+            {
+                "speculative_config": {
+                    "method": "mtp",
+                    "model": "google/gemma-4-31B-it-assistant",
+                    "num_speculative_tokens": 4,
+                },
+                "max_parallel_loading_workers": 32,
+            },
+            [
+                "--speculative-config",
+                '{"method": "mtp", "model": "google/gemma-4-31B-it-assistant", "num_speculative_tokens": 4}',
+                "--max-parallel-loading-workers",
+                "32",
+            ],
+        ),
     ],
 )
 def test_engine_kwargs_to_cli_flags(engine_kwargs: dict, expected: list[str]) -> None:

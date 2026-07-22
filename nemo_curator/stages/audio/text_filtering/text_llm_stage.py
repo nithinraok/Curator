@@ -178,6 +178,8 @@ class TextLLMStage(ProcessingStage[AudioTask, AudioTask]):
         max_deletion_ratio: Max fraction of words that can be removed.
         tensor_parallel_size: GPUs for TP (None = auto-detect).
         max_output_tokens: Max tokens to generate per sample.
+        temperature: Sampling temperature.
+        top_p: Nucleus-sampling probability.
         max_model_len: Max context length for vLLM.
         max_num_seqs: Max concurrent sequences in vLLM.
         gpu_memory_utilization: Fraction of GPU memory for vLLM.
@@ -205,6 +207,8 @@ class TextLLMStage(ProcessingStage[AudioTask, AudioTask]):
     script_drift_min_chars: int = 3
     tensor_parallel_size: int | None = None
     max_output_tokens: int = 512
+    temperature: float = 0.0
+    top_p: float = 1.0
     max_model_len: int = 2048
     max_num_seqs: int = 64
     gpu_memory_utilization: float = 0.95
@@ -265,7 +269,11 @@ class TextLLMStage(ProcessingStage[AudioTask, AudioTask]):
             gpu_memory_utilization=self.gpu_memory_utilization,
             kv_cache_dtype=self.kv_cache_dtype,
         )
-        self._sampling_params = SamplingParams(temperature=0, max_tokens=self.max_output_tokens)
+        self._sampling_params = SamplingParams(
+            temperature=self.temperature,
+            top_p=self.top_p,
+            max_tokens=self.max_output_tokens,
+        )
         logger.info(
             "{}: ready (prompt={} chars, output_key={})", self.name, len(self._system_prompt), self.output_text_key
         )

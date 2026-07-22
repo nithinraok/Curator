@@ -109,15 +109,24 @@ _DISAGG_NIXL_PORT_SEED = 20097
 
 
 def dynamo_runtime_env(model_config: DynamoVLLMModelConfig) -> dict[str, Any]:
-    """Merge the user's ``runtime_env`` with the Dynamo-vLLM package pin."""
-    return BaseModelConfig.merge_runtime_envs(DYNAMO_VLLM_RUNTIME_ENV, model_config.runtime_env or None)
+    """Build the worker runtime env, optionally reusing preinstalled packages.
+
+    ``install_runtime_dependencies=False`` is an explicit container-image
+    contract: the current Python environment must already provide compatible
+    Dynamo, vLLM, and Ray packages. It avoids Ray cloning the driver's entire
+    virtualenv for every runtime environment.
+    """
+    base = DYNAMO_VLLM_RUNTIME_ENV if model_config.install_runtime_dependencies else {}
+    return BaseModelConfig.merge_runtime_envs(base, model_config.runtime_env or None)
 
 
 def merge_model_runtime_envs(models: list[DynamoVLLMModelConfig]) -> dict[str, Any]:
     """Merge every model's ``runtime_env`` onto the Dynamo-vLLM pin for the shared frontend actor."""
     envs = [m.runtime_env for m in models if m.runtime_env]
     user_merged = reduce(BaseModelConfig.merge_runtime_envs, envs) if envs else None
-    return BaseModelConfig.merge_runtime_envs(DYNAMO_VLLM_RUNTIME_ENV, user_merged)
+    install_dependencies = any(m.install_runtime_dependencies for m in models)
+    base = DYNAMO_VLLM_RUNTIME_ENV if install_dependencies else {}
+    return BaseModelConfig.merge_runtime_envs(base, user_merged)
 
 
 def _async_scheduling_cli_flags(engine_kwargs: dict[str, Any]) -> list[str]:

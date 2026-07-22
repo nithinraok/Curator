@@ -44,6 +44,7 @@ from nemo_curator.stages.resources import Resources
 
 if TYPE_CHECKING:
     from nemo_curator.backends.base import WorkerMetadata
+    from nemo_curator.models.client.openai_client import QueueBackpressureConfig
     from nemo_curator.stages.audio.text_filtering.remote_text_llm_stage import RemoteTextLLMStage
     from nemo_curator.tasks import AudioTask
 
@@ -79,6 +80,7 @@ class FusedRemoteTextLLMStage(ProcessingStage["AudioTask", "AudioTask"]):
     served_model_name: str | None = None
     max_concurrent_requests: int = 64
     request_timeout: int = 120
+    queue_backpressure: QueueBackpressureConfig | None = None
 
     name: str = "FusedRemoteTextLLM"
     resources: Resources = field(default_factory=lambda: Resources(cpus=1.0))
@@ -114,6 +116,7 @@ class FusedRemoteTextLLMStage(ProcessingStage["AudioTask", "AudioTask"]):
             base_url=self.inference_base_url,
             api_key=self.inference_api_key,
             timeout=self.request_timeout,
+            queue_backpressure=self.queue_backpressure,
         )
         self._client.setup()
 
@@ -122,8 +125,8 @@ class FusedRemoteTextLLMStage(ProcessingStage["AudioTask", "AudioTask"]):
 
         for sub in self.sub_stages:
             self._gen_configs[sub.name] = GenerationConfig(
-                temperature=0.0,
-                top_p=1.0,
+                temperature=sub.temperature,
+                top_p=sub.top_p,
                 max_tokens=sub.max_output_tokens,
                 seed=0,
                 extra_kwargs={"extra_body": {"chat_template_kwargs": {"enable_thinking": False}}},
@@ -201,7 +204,11 @@ class FusedRemoteTextLLMStage(ProcessingStage["AudioTask", "AudioTask"]):
                 model=model,
                 generation_config=self._gen_configs[sub_name],
             )
-            return sub_name, seq_idx, ((resp[0] if resp else None) or "").strip()   # server can return [None] for empty completions
+            return (
+                sub_name,
+                seq_idx,
+                ((resp[0] if resp else None) or "").strip(),
+            )  # server can return [None] for empty completions
 
         async def _all() -> list[tuple[str, int, str]]:
             coros = []

@@ -59,6 +59,7 @@ dependencies = [
     "cosmos-xenna==0.2.0",
     "fsspec",
     "hydra-core",
+    "httpx",
     "jieba==0.42.1",
     "loguru",
     "mecab-python3",

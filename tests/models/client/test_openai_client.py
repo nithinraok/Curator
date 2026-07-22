@@ -23,7 +23,13 @@ from unittest.mock import AsyncMock, Mock, patch
 import pytest
 
 from nemo_curator.models.client.llm_client import ConversationFormatter, GenerationConfig
-from nemo_curator.models.client.openai_client import AsyncOpenAIClient, OpenAIClient
+from nemo_curator.models.client.openai_client import (
+    AsyncOpenAIClient,
+    OpenAIClient,
+    QueueBackpressureConfig,
+    _default_metrics_url,
+    _prometheus_metric_total,
+)
 
 
 class TestOpenAIClient:
@@ -218,6 +224,42 @@ class TestOpenAIClient:
             mock_setup.assert_not_called()
 
         assert client.client is existing_client
+
+
+class TestQueueBackpressure:
+    def test_config_validation(self) -> None:
+        with pytest.raises(ValueError, match="max_waiting_requests"):
+            QueueBackpressureConfig(max_waiting_requests=0)
+
+    def test_default_metrics_url_strips_openai_v1(self) -> None:
+        assert _default_metrics_url("http://server:8000/v1") == "http://server:8000/metrics"
+        assert _default_metrics_url("http://server:8000/v1/") == "http://server:8000/metrics"
+
+    def test_prometheus_metric_total_sums_labelled_replicas(self) -> None:
+        payload = """
+        # HELP vllm:num_requests_waiting Number of requests waiting.
+        vllm:num_requests_waiting{model_name="gemma",replica="0"} 2
+        vllm:num_requests_waiting{model_name="gemma",replica="1"} 3
+        vllm:num_requests_running 9
+        """
+        assert _prometheus_metric_total(payload, "vllm:num_requests_waiting") == 5
+
+    @pytest.mark.asyncio
+    async def test_waits_until_queue_drops_below_limit(self) -> None:
+        client = AsyncOpenAIClient(
+            base_url="http://server:8000/v1",
+            queue_backpressure=QueueBackpressureConfig(
+                max_waiting_requests=2048,
+                poll_interval_seconds=0.25,
+            ),
+        )
+        with (
+            patch.object(client, "_read_waiting_requests", AsyncMock(side_effect=[2048, 2047])),
+            patch("nemo_curator.models.client.openai_client.asyncio.sleep", new_callable=AsyncMock) as sleep,
+        ):
+            await client._wait_for_queue_capacity()
+
+        sleep.assert_awaited_once_with(0.25)
 
 
 class TestAsyncOpenAIClient:

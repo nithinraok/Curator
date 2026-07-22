@@ -43,6 +43,7 @@ from nemo_curator.stages.resources import Resources
 
 if TYPE_CHECKING:
     from nemo_curator.backends.base import WorkerMetadata
+    from nemo_curator.models.client.openai_client import QueueBackpressureConfig
     from nemo_curator.tasks import AudioTask
 
 
@@ -61,6 +62,7 @@ class RemoteRecoverEntitiesStage(RecoverEntitiesStage):
     served_model_name: str | None = None
     max_concurrent_requests: int = 64
     request_timeout: int = 120
+    queue_backpressure: QueueBackpressureConfig | None = None
 
     _client: Any = field(default=None, init=False, repr=False)
     _gen_config: Any = field(default=None, init=False, repr=False)
@@ -88,6 +90,7 @@ class RemoteRecoverEntitiesStage(RecoverEntitiesStage):
             base_url=self.inference_base_url,
             api_key=self.inference_api_key,
             timeout=self.request_timeout,
+            queue_backpressure=self.queue_backpressure,
         )
         self._client.setup()
         # One event loop for this actor's lifetime so the async client (and its
