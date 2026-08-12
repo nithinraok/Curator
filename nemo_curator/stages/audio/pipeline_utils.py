@@ -20,6 +20,8 @@ Provides:
 - ``INDIC_CONFORMER_LANGUAGE_CODES`` — languages supported by AI4Bharat Indic Conformer (ISO codes)
 - ``PARAKEET_LANGUAGE_CODES`` — languages routed to NVIDIA Parakeet-TDT v3 in recovery ASR
 - ``WHISPER_ROUTED_LANGUAGE_CODES`` — languages routed to Faster-Whisper in recovery ASR
+- ``SCRIPTIO_CONTINUA_LANGUAGE_CODES`` — languages written without spaces between words
+- ``is_scriptio_continua`` — whether a language needs character- rather than word-based metrics
 - ``resolve_indic_language_code`` — normalize ``source_lang`` to an Indic Conformer code when applicable
 - ``resolve_parakeet_language_code`` — normalize ``source_lang`` to a Parakeet-routed code when applicable
 - ``resolve_whisper_language_code`` — normalize ``source_lang`` to a faster-whisper ``language`` code when applicable
@@ -64,6 +66,21 @@ PARAKEET_LANGUAGE_CODES: frozenset[str] = frozenset({
 # Manifest/source_lang codes covered by language-routed Faster-Whisper recovery (see MODEL_LANG_CODE_TO_WHISPER).
 WHISPER_ROUTED_LANGUAGE_CODES: frozenset[str] = frozenset({
     "ro", "hu", "el", "fi", "da", "sv", "th", "fil", "tl", "fa",
+})
+
+# Manifest/source_lang codes written in scriptio continua — i.e. without spaces between words.
+# Whitespace tokenization (``text.split()``) yields a SINGLE token for these languages, so any
+# word-based metric or heuristic computed over ``text.split()`` is meaningless for them and must
+# fall back to a character-based equivalent. See ``is_scriptio_continua``.
+SCRIPTIO_CONTINUA_LANGUAGE_CODES: frozenset[str] = frozenset({
+    "ja",                                      # Japanese
+    "zh", "zh-cn", "zh-tw", "zh-hans", "zh-hant",  # Chinese (+ common locale tags)
+    "yue",                                     # Cantonese
+    "th",                                      # Thai
+    "lo",                                      # Lao
+    "km",                                      # Khmer
+    "my",                                      # Burmese
+    "bo", "dz",                                # Tibetan, Dzongkha
 })
 
 # Map manifest ISO codes to faster-whisper ``transcribe(language=...)`` codes when they differ.
@@ -139,6 +156,28 @@ def resolve_whisper_language_code(
         if code in whisper_codes and name.lower() == s:
             return MODEL_LANG_CODE_TO_WHISPER.get(code, code)
     return None
+
+
+def is_scriptio_continua(
+    raw: str | None,
+    *,
+    spaceless_codes: frozenset[str] = SCRIPTIO_CONTINUA_LANGUAGE_CODES,
+) -> bool:
+    """Whether ``raw`` denotes a language written without spaces between words.
+
+    Accepts ISO codes (e.g. ``ja``, ``zh``), locale tags (``zh-CN``, ``zh_TW``) or full
+    English names from ``LANG_CODE_TO_NAME`` (e.g. ``Japanese``, ``japanese``).
+
+    Callers use this to substitute a character-based metric for a word-based one:
+    ``"日本語のテキスト".split()`` is one token, so word-level WER between two such texts
+    can only ever be 0 or 100 and word-length heuristics see the whole utterance as one word.
+    """
+    if raw is None:
+        return False
+    s = str(raw).strip().lower().replace("_", "-")
+    if s in spaceless_codes:
+        return True
+    return any(code in spaceless_codes and name.lower() == s for code, name in LANG_CODE_TO_NAME.items())
 
 
 def set_note(task_data: dict[str, Any], stage_name: str, value: str, notes_key: str = NOTES_KEY) -> None:

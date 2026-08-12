@@ -16,7 +16,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from nemo_curator.stages.audio.metrics.get_wer import get_wer
+from nemo_curator.stages.audio.metrics.get_wer import get_cer, get_wer
+from nemo_curator.stages.audio.pipeline_utils import is_scriptio_continua
 from nemo_curator.stages.base import ProcessingStage
 from nemo_curator.stages.resources import Resources
 from nemo_curator.tasks import AudioTask
@@ -26,11 +27,15 @@ from nemo_curator.tasks import AudioTask
 class DisfluencyWerGuardStage(ProcessingStage[AudioTask, AudioTask]):
     """Fall back to the base prediction when disfluency removal diverges too much.
 
-    Computes word-error-rate between ``ref_text_key`` (turn-1 prediction)
-    and ``hyp_text_key`` (turn-2 / disfluency-cleaned prediction).  If
-    WER exceeds ``max_wer_pct``, the turn-2 field is overwritten with the
+    Computes the error rate between ``ref_text_key`` (turn-1 prediction)
+    and ``hyp_text_key`` (turn-2 / disfluency-cleaned prediction).  If it
+    exceeds ``max_wer_pct``, the turn-2 field is overwritten with the
     turn-1 value because the disfluency pass changed the content too
     aggressively.
+
+    WER is used by default and **CER** for languages written without spaces
+    (``SCRIPTIO_CONTINUA_LANGUAGE_CODES``), where each text is a single
+    whitespace token and WER can only be 0, 100 or 200.
 
     The computed WER is always stored in ``wer_key`` for downstream
     inspection regardless of whether a fallback occurred.
@@ -41,6 +46,7 @@ class DisfluencyWerGuardStage(ProcessingStage[AudioTask, AudioTask]):
     wer_key: str = "disfluency_wer"
     max_wer_pct: float = 50.0
     skip_me_key: str = "_skipme"
+    language_key: str = "source_lang"
     name: str = "DisfluencyWerGuard"
     resources: Resources = field(default_factory=lambda: Resources(cpus=1.0))
 
@@ -62,7 +68,8 @@ class DisfluencyWerGuardStage(ProcessingStage[AudioTask, AudioTask]):
             task.data[self.wer_key] = -1.0
             return task
 
-        wer = get_wer(ref, hyp)
+        metric_fn = get_cer if is_scriptio_continua(task.data.get(self.language_key)) else get_wer
+        wer = metric_fn(ref, hyp)
         task.data[self.wer_key] = wer
 
         if wer > self.max_wer_pct:

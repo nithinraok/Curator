@@ -160,3 +160,50 @@ def test_non_agglutinative_lang_uses_default_threshold(tmp_path: Path) -> None:
     task = AudioTask(data={_TEXT_KEY: f"the {word_26} here", _SKIP_KEY: "", "language": "en"})
     result = stage.process(task)
     assert "Hallucination" in result.data[_SKIP_KEY]
+
+
+# --- scriptio continua (space-less) languages -------------------------------------------------
+# These are written without spaces, so text.split() returns the whole utterance as ONE token.
+# The word-level checks must not run: _long_word would flag every utterance over the threshold.
+
+_JA_LONG = "なんかおばあちゃんのレシピみたいなあのどんな思い出とか食べ物とかでどんな思い出とかあったりしますか"
+
+
+def test_scriptio_continua_long_utterance_not_flagged(tmp_path: Path) -> None:
+    """A 50-char Japanese sentence is one whitespace token — must NOT trip _long_word."""
+    stage = _make_stage(tmp_path, [])
+    task = AudioTask(data={_TEXT_KEY: _JA_LONG, _SKIP_KEY: "", "language": "ja"})
+    result = stage.process(task)
+    assert result.data[_SKIP_KEY] == ""
+
+
+@pytest.mark.parametrize("lang", ["ja", "zh", "th", "zh-CN", "yue", "Japanese"])
+def test_scriptio_continua_langs_skip_word_checks(tmp_path: Path, lang: str) -> None:
+    stage = _make_stage(tmp_path, [])
+    task = AudioTask(data={_TEXT_KEY: "字" * 60, _SKIP_KEY: "", "language": lang})
+    result = stage.process(task)
+    assert result.data[_SKIP_KEY] == ""
+
+
+def test_same_text_without_language_is_still_flagged(tmp_path: Path) -> None:
+    """Control: the skip is driven by the language field, not by the text itself."""
+    stage = _make_stage(tmp_path, [])
+    task = AudioTask(data={_TEXT_KEY: _JA_LONG, _SKIP_KEY: "", "language": "en"})
+    result = stage.process(task)
+    assert "Hallucination" in result.data[_SKIP_KEY]
+
+
+def test_scriptio_continua_still_flags_phrase_match(tmp_path: Path) -> None:
+    """Character-level checks stay active for space-less languages."""
+    stage = _make_stage(tmp_path, ["ご視聴ありがとうございました"])
+    task = AudioTask(data={_TEXT_KEY: "ご視聴ありがとうございました", _SKIP_KEY: "", "language": "ja"})
+    result = stage.process(task)
+    assert "Hallucination" in result.data[_SKIP_KEY]
+
+
+def test_scriptio_continua_still_flags_high_char_rate(tmp_path: Path) -> None:
+    """High char rate is character-based and must keep firing for space-less languages."""
+    stage = _make_stage(tmp_path, [], max_char_rate=40.0)
+    task = AudioTask(data={_TEXT_KEY: "字" * 100, _SKIP_KEY: "", "language": "ja", "duration": 1.0})
+    result = stage.process(task)
+    assert "Hallucination" in result.data[_SKIP_KEY]
