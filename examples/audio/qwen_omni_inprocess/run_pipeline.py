@@ -976,6 +976,7 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
                 ref_text_key="primary_model_prediction",
                 hyp_text_key="primary_model_prediction_s2",
                 max_wer_pct=50.0,
+                language_key=args.source_lang_key,
             )
         )
 
@@ -1129,6 +1130,7 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
             use_ground_truth_for_short_audio=short_audio_gt,
             short_audio_threshold=args.short_audio_threshold,
             primary_model_type=args.primary_model,
+            language_key=args.source_lang_key,
         )
     )
 

@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 
 from loguru import logger
 
-from nemo_curator.stages.audio.pipeline_utils import set_note
+from nemo_curator.stages.audio.pipeline_utils import is_scriptio_continua, set_note
 from nemo_curator.stages.base import ProcessingStage
 from nemo_curator.stages.resources import Resources
 from nemo_curator.tasks import AudioTask
@@ -37,6 +37,10 @@ class WhisperHallucinationStage(ProcessingStage[AudioTask, AudioTask]):
     - Frequent single phrase: the full transcript matches a known hallucination phrase.
     - High char rate: word-chars / duration > max_char_rate (impossible speech rate; short audio
       with dense confabulated text, e.g. Whisper generating a full sentence over 0.1 s).
+
+    The two word-level checks (repeated n-grams, long word) are skipped for languages written
+    in scriptio continua (``SCRIPTIO_CONTINUA_LANGUAGE_CODES``), where whitespace tokenization
+    produces a single token and makes them meaningless. The character-level checks still apply.
 
     When flagged, ``_skipme`` is set to ``"Hallucination:{name}"`` to track
     which stage instance produced the flag.  By default an already non-empty
@@ -123,6 +127,9 @@ class WhisperHallucinationStage(ProcessingStage[AudioTask, AudioTask]):
         lang = str(task.data.get(self.language_key, "")).lower().strip()
         return lang in AGGLUTINATIVE_COMPOUNDING_LANGS
 
+    def _is_scriptio_continua(self, task: AudioTask) -> bool:
+        return is_scriptio_continua(task.data.get(self.language_key))
+
     def _process_single(self, task: AudioTask) -> AudioTask:
         current_flag = str(task.data.get(self.skip_me_key, ""))
         if not self.overwrite and current_flag:
@@ -137,8 +144,18 @@ class WhisperHallucinationStage(ProcessingStage[AudioTask, AudioTask]):
 
         is_agglutinative = self._is_agglutinative(task)
         long_word_thresh = self.agglutinative_long_word_threshold if is_agglutinative else self.long_word_threshold
-        repeated = self._repeated_ngrams(words)
-        long_w = self._long_word(words, threshold=long_word_thresh, skip_relative=is_agglutinative)
+        # Japanese/Chinese/Thai/... are written without spaces, so ``words`` is the whole utterance
+        # as a single token. ``_long_word`` would then flag every utterance longer than the
+        # threshold (~all of them) and ``_repeated_ngrams`` can never fire (ratio is always 1/1).
+        # Both checks are word-level by construction, so skip them rather than report noise.
+        # ``_frequent_single_word`` and ``_high_char_rate`` operate on characters and stay active.
+        word_based_applicable = not self._is_scriptio_continua(task)
+        repeated = self._repeated_ngrams(words) if word_based_applicable else False
+        long_w = (
+            self._long_word(words, threshold=long_word_thresh, skip_relative=is_agglutinative)
+            if word_based_applicable
+            else False
+        )
         phrase = self._frequent_single_word(text)
         high_rate = self._high_char_rate(words, duration)
 

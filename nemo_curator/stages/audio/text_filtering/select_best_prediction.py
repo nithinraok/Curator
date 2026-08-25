@@ -17,8 +17,8 @@ from dataclasses import dataclass, field
 
 from loguru import logger
 
-from nemo_curator.stages.audio.metrics.get_wer import get_wer
-from nemo_curator.stages.audio.pipeline_utils import set_note
+from nemo_curator.stages.audio.metrics.get_wer import get_cer, get_wer
+from nemo_curator.stages.audio.pipeline_utils import is_scriptio_continua, set_note
 from nemo_curator.stages.base import ProcessingStage
 from nemo_curator.stages.resources import Resources
 from nemo_curator.tasks import AudioTask
@@ -53,8 +53,13 @@ class SelectBestPredictionStage(ProcessingStage[AudioTask, AudioTask]):
     2. **ASR recovery** -- if ``notes_key`` contains "Recovered" and
        ``asr_text_key`` is non-empty, the ASR prediction is used.
     3. **Cross-model agreement** -- if *both* omni and ASR were flagged as
-       hallucinated yet their texts agree (WER ≤ ``100 - min_agreement_pct``),
+       hallucinated yet their texts agree (error rate ≤ ``100 - min_agreement_pct``),
        the omni prediction is kept and the sample is marked recovered.
+       Agreement is measured with WER, or with **CER** for languages written without
+       spaces (``SCRIPTIO_CONTINUA_LANGUAGE_CODES``): each such text is a single
+       whitespace token, so word-level WER collapses to 0/100/200 and the check would
+       only ever pass on byte-identical predictions. The metric used is recorded in
+       ``metric_key``.
     4. **Fallback** -- the primary (omni) prediction is used as-is.
 
     When ``use_reference_on_hallucination`` is enabled and the primary output
@@ -77,8 +82,10 @@ class SelectBestPredictionStage(ProcessingStage[AudioTask, AudioTask]):
     notes_key: str = "additional_notes"
     skip_me_key: str = "_skipme"
     duration_key: str = "duration"
+    language_key: str = "source_lang"
     min_agreement_pct: float = 80.0
     agreement_wer_key: str = "omni_asr_agreement_wer"
+    metric_key: str = "omni_asr_agreement_metric"
     primary_source_label: str = "primary"
     fallback_source_label: str = "fallback"
     reference_text_key: str | None = None
@@ -99,7 +106,7 @@ class SelectBestPredictionStage(ProcessingStage[AudioTask, AudioTask]):
         return [], keys
 
     def outputs(self) -> tuple[list[str], list[str]]:
-        return [], [self.output_key, self.skip_me_key, self.agreement_wer_key, self.source_key]
+        return [], [self.output_key, self.skip_me_key, self.agreement_wer_key, self.metric_key, self.source_key]
 
     def process(self, task: AudioTask) -> AudioTask:  # noqa: C901, PLR0911, PLR0915
         # Short audio: Qwen Omni hallucinates on <1s clips — use ground truth when available.
@@ -204,17 +211,26 @@ class SelectBestPredictionStage(ProcessingStage[AudioTask, AudioTask]):
         # Cross-model agreement: both hallucinated but texts match
         both_hallucinated = skip_me.startswith("Hallucination") and asr_pred
         if both_hallucinated and primary_pred:
-            wer = get_wer(_normalize_for_wer(primary_pred), _normalize_for_wer(asr_pred))
-            task.data[self.agreement_wer_key] = wer
-            if wer <= (100.0 - self.min_agreement_pct):
+            use_cer = is_scriptio_continua(task.data.get(self.language_key))
+            metric_name = "cer" if use_cer else "wer"
+            metric_fn = get_cer if use_cer else get_wer
+            error_rate = metric_fn(_normalize_for_wer(primary_pred), _normalize_for_wer(asr_pred))
+            task.data[self.agreement_wer_key] = error_rate
+            task.data[self.metric_key] = metric_name
+            if error_rate <= (100.0 - self.min_agreement_pct):
                 logger.debug(
-                    f"[{self.name}] cross-model agreement recovery: WER={wer:.1f}% "
+                    f"[{self.name}] cross-model agreement recovery: {metric_name.upper()}={error_rate:.1f}% "
                     f"(threshold {100.0 - self.min_agreement_pct:.1f}%), keeping omni prediction"
                 )
                 task.data[self.output_key] = primary_pred
                 task.data[self.source_key] = self.primary_source_label
                 task.data[self.skip_me_key] = ""
-                set_note(task.data, self.name, f"recovered:cross_model_agreement (wer={wer:.1f}%)", self.notes_key)
+                set_note(
+                    task.data,
+                    self.name,
+                    f"recovered:cross_model_agreement ({metric_name}={error_rate:.1f}%)",
+                    self.notes_key,
+                )
                 return task
 
         # Case 2 (default): primary OK (fallback may have been skipped or is irrelevant)
