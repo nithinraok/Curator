@@ -16,12 +16,15 @@
 
 Routing under test (see the stage docstring):
   * no predictions               -> skip
+  * Canary recovery language with all models Indic -> use Canary without exact agreement
   * Whisper == "en"              -> accept Whisper (English)
   * Whisper missing/empty        -> skip
-  * SpeechBrain + Canary + Whisper all agree -> use Canary
+  * SpeechBrain + Canary + Whisper agree on another supported Indic language -> use Canary
   * non-Indic Whisper + SpeechBrain agree    -> use Whisper
   * otherwise (disagreement)     -> skip
 """
+
+import pytest
 
 from nemo_curator.stages.audio.inference.langid_base import LangIDResult
 from nemo_curator.stages.audio.text_filtering.select_best_lid_prediction import SelectBestLIDPredictionStage
@@ -130,6 +133,52 @@ def test_all_three_agree_uses_canary() -> None:
     assert notes["secondary_lid_prediction"] == "hi"
     assert notes["tertiary_lid_prediction"] == "hi"
     assert notes["SelectBestLIDPrediction"] == "used secondary, agreement between all 3 langID models."
+    assert "_skipme" not in out.data
+
+
+@pytest.mark.parametrize(
+    "language", ["or", "brx", "doi", "kok", "ks", "mai", "mni", "sat"]
+)
+def test_recovery_indic_language_uses_canary_when_all_models_are_indic(language: str) -> None:
+    """Recovery-language LID retains Canary when all models are Indic but disagree."""
+    stage = SelectBestLIDPredictionStage()
+    task = AudioTask(
+        data={
+            "lid": [
+                {"SpeechBrainLangID": LangIDResult(language="hi", confidence=0.80, tag="primary")},
+                {"IndicCanaryLangID": LangIDResult(language=language, confidence=0.97, tag="secondary")},
+                {"WhisperLangID": LangIDResult(language="bn", confidence=0.90, tag="tertiary")},
+            ]
+        }
+    )
+
+    out = stage.process(task)
+
+    assert out.data["source_lang"] == language
+    assert out.data["additional_notes"]["source_lid_confidence"] == 0.97
+    assert out.data["additional_notes"]["SelectBestLIDPrediction"] == (
+        "used secondary, recovery Indic language (all models Indic)."
+    )
+    assert "_skipme" not in out.data
+
+
+def test_recovery_canary_label_is_not_used_when_whisper_is_non_indic() -> None:
+    """Recovery routing requires every LID model to identify an Indic language."""
+    stage = SelectBestLIDPredictionStage()
+    task = AudioTask(
+        data={
+            "lid": [
+                {"SpeechBrainLangID": LangIDResult(language="hi", confidence=0.80, tag="primary")},
+                {"IndicCanaryLangID": LangIDResult(language="or", confidence=0.97, tag="secondary")},
+                {"WhisperLangID": LangIDResult(language="en", confidence=0.90, tag="tertiary")},
+            ]
+        }
+    )
+
+    out = stage.process(task)
+
+    assert out.data["source_lang"] == "en"
+    assert out.data["additional_notes"]["SelectBestLIDPrediction"] == "used tertiary, English language."
     assert "_skipme" not in out.data
 
 
