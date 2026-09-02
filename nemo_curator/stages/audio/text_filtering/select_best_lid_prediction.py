@@ -17,10 +17,14 @@
 Reads ``LangIDResult`` entries from ``task.data[lid_key]``. Routing (in order):
 
 - No predictions at all → set ``_skipme``.
+- Indic Canary predicts one of the eight recovery languages, while all three
+  models predict a supported Indic language → use Canary's label without exact
+  three-way agreement.
 - Whisper predicts **English** (``en``) → accept Whisper's language.
 - Whisper is missing or empty → set ``_skipme`` (Whisper is required for the checks below).
-- SpeechBrain/AmberNet, Indic Canary, and Whisper **all agree** → use Indic Canary as
-  ``source_lang`` (records an agreement note).
+- SpeechBrain/AmberNet, Indic Canary, and Whisper **all agree on another of
+  Indic Canary's 22 supported languages** → use Indic Canary as ``source_lang``
+  (records an agreement note).
 - Whisper predicts a **non-Indic** language and SpeechBrain/AmberNet agrees → use Whisper.
 - Otherwise (disagreement, or an Indic language without full 3-way agreement) → set ``_skipme``.
 
@@ -38,6 +42,9 @@ from nemo_curator.stages.base import ProcessingStage
 from nemo_curator.stages.resources import Resources
 from nemo_curator.tasks import AudioTask
 
+# The 22 languages supported by the Indic Canary LID engine.  Keep this aligned
+# with ``INDIC_CONFORMER_LANGUAGE_CODES``; the recovery languages below are a
+# subset of this set.
 _DEFAULT_INDIC_LANGUAGES: frozenset[str] = frozenset(
     {
         "hi",
@@ -65,6 +72,13 @@ _DEFAULT_INDIC_LANGUAGES: frozenset[str] = frozenset(
         "brx",
         "bo",
     }
+)
+
+# These languages require recovery routing elsewhere in the audio pipeline.
+# Their Indic Canary LID result takes precedence when every LID model identifies
+# the audio as one of the 22 supported Indic languages.
+_RECOVERY_INDIC_LANGUAGES: frozenset[str] = frozenset(
+    {"or", "brx", "doi", "kok", "ks", "mai", "mni", "sat"}
 )
 
 _MODEL_LABELS = {
@@ -148,7 +162,27 @@ class SelectBestLIDPredictionStage(ProcessingStage[AudioTask, AudioTask]):
                     whisper_result = result
                 else:
                     raise ValueError(f"Invalid model name: {model_name}")
-        
+
+        # The recovery languages are Canary-first, but all three models must
+        # still identify the audio as Indic. Their exact language labels do
+        # not have to agree.
+        if (
+            sb_result is not None
+            and canary_result is not None
+            and whisper_result is not None
+            and sb_result.language in self.indic_languages
+            and canary_result.language in _RECOVERY_INDIC_LANGUAGES
+            and whisper_result.language in self.indic_languages
+        ):
+            task.data[self.output_key] = canary_result.language
+            task.data[self.notes_key][self.confidence_key] = float(canary_result.confidence)
+            set_note(
+                task.data,
+                self.name,
+                f"used {canary_result.tag}, recovery Indic language (all models Indic).",
+            )
+            return task
+
         # Whisper predicts English -> accept it outright.
         if whisper_result is not None and whisper_result.language == "en":
             task.data[self.output_key] = whisper_result.language
@@ -168,12 +202,13 @@ class SelectBestLIDPredictionStage(ProcessingStage[AudioTask, AudioTask]):
             set_note(task.data, self.name, "skipped (missing or empty whisper langID prediction)", self.notes_key)
             return task
 
-        # If all 3 models agree on the language, use the Canary result.
+        # For all other Indic Canary languages, require three-way agreement.
         if (
             sb_result is not None
             and canary_result is not None
             and canary_result.language == sb_result.language
             and whisper_result.language == sb_result.language
+            and canary_result.language in self.indic_languages
         ):
             task.data[self.output_key] = canary_result.language
             task.data[self.notes_key][self.confidence_key] = float(canary_result.confidence)
