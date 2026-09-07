@@ -148,12 +148,9 @@ class RemoteTextLLMStage(TextLLMStage):
         Mirrors :meth:`TextLLMStage._format_prompt` message construction
         but returns the raw message list instead of a templated string.
         """
-        prompt_template = self._system_prompt
-        if "{language}" in prompt_template:
-            lang = task_data.get("source_lang", "English") if task_data else "English"
-            prompt_template = prompt_template.replace("{language}", lang)
-        if "{text}" in prompt_template:
-            prompt_template = prompt_template.replace("{text}", user_text)
+        embeds_text = "{text}" in self._system_prompt
+        prompt_template = self._render_prompt_template(user_text, task_data)
+        if embeds_text:
             return [{"role": "user", "content": prompt_template}]
         return [
             {"role": "system", "content": prompt_template},

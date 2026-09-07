@@ -92,17 +92,17 @@ from nemo_curator.stages.audio.alm.sharded_manifest_writer import ShardedManifes
 from nemo_curator.stages.audio.text_filtering.acoustic_distractor import AcousticDistractorStage
 from nemo_curator.stages.audio.text_filtering.contextual_asr_extraction import ContextualASRExtractionStage
 from nemo_curator.stages.audio.text_filtering.contextual_asr_prompt_variant import ContextualASRPromptVariantStage
+from nemo_curator.stages.audio.text_filtering.fused_remote_text_llm_stage import FusedRemoteTextLLMStage
 from nemo_curator.stages.audio.text_filtering.instruction_packer import InstructionPackerStage
 from nemo_curator.stages.audio.text_filtering.llm_language_verification import LLMLanguageVerificationStage
+from nemo_curator.stages.audio.text_filtering.pnc_language_rules import load_pnc_language_rules
 from nemo_curator.stages.audio.text_filtering.remote_contextual_asr_extraction import (
     RemoteContextualASRExtractionStage,
 )
-from nemo_curator.stages.audio.text_filtering.fused_remote_text_llm_stage import FusedRemoteTextLLMStage
 from nemo_curator.stages.audio.text_filtering.remote_recover_entities import RemoteRecoverEntitiesStage
 from nemo_curator.stages.audio.text_filtering.remote_text_llm_stage import RemoteTextLLMStage
 from nemo_curator.stages.audio.text_filtering.text_llm_stage import TextLLMStage
 from nemo_curator.stages.resources import Resources
-
 
 _PROMPT_DIR = (
     Path(__file__).resolve().parent.parent.parent.parent
@@ -117,6 +117,8 @@ _TN_PROMPT = _PROMPT_DIR / "tn_prompt.md"
 _CORRECTION_PROMPT = _PROMPT_DIR / "correction_prompt.md"
 _CAPTIONING_PROMPT = _PROMPT_DIR / "captioning_prompt.md"
 _PNC_PROMPT = _PROMPT_DIR / "pnc_prompt.md"
+_PNC_INDIC_PROMPT = _PROMPT_DIR / "pnc_prompt_indic.md"
+_PNC_LANGUAGE_RULES = _PROMPT_DIR / "pnc_language_rules.json"
 _CONTEXT_ASR_PROMPT = _PROMPT_DIR / "contextual_asr_prompt.md"
 
 # Minimum recommended max_model_len when --enable_context_asr is used.
@@ -126,6 +128,12 @@ _CODE_SWITCHING_PROMPT = _PROMPT_DIR / "code_switching_prompt.md"
 _SPEECH_QA_PROMPT = _PROMPT_DIR / "speech_qa_prompt.md"
 _LANGUAGE_ID_PROMPT = _PROMPT_DIR / "language_id_prompt.md"
 _RECOVER_ENTITIES_PROMPT = _PROMPT_DIR / "recover_entities_prompt.md"
+
+
+def _resolve_pnc_prompt_file(custom_prompt_file: str | None, *, use_indic_prompt: bool) -> str:
+    if use_indic_prompt:
+        return str(_PNC_INDIC_PROMPT)
+    return custom_prompt_file or str(_PNC_PROMPT)
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
@@ -307,8 +315,26 @@ def _build_arg_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
         default=None,
         help="Path to captioning prompt file. Defaults to bundled captioning_prompt.md.",
     )
+    pnc_prompt_group = ap.add_mutually_exclusive_group()
+    pnc_prompt_group.add_argument(
+        "--pnc_prompt_file",
+        type=str,
+        default=None,
+        help="Path to a custom PnC prompt file. Defaults to the shared bundled pnc_prompt.md.",
+    )
+    pnc_prompt_group.add_argument(
+        "--use_indic_pnc_prompt",
+        action="store_true",
+        help="Use the bundled row-scoped Indic P3 V6 prompt (pnc_prompt_indic.md).",
+    )
     ap.add_argument(
-        "--pnc_prompt_file", type=str, default=None, help="Path to PnC prompt file. Defaults to bundled pnc_prompt.md."
+        "--pnc_language_rules_file",
+        type=str,
+        default=None,
+        help=(
+            "JSON mapping used to resolve the PnC prompt's {language_rules} placeholder. "
+            "Defaults to bundled pnc_language_rules.json and is loaded only when the selected prompt uses the placeholder."
+        ),
     )
     ap.add_argument(
         "--language_id_prompt_file",
@@ -825,7 +851,19 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
     itn_prompt = args.itn_prompt_file or str(_ITN_PROMPT)
     itn_no_disfl_prompt = args.itn_no_disfluencies_prompt_file or str(_CORRECTION_PROMPT)
     captioning_prompt = args.captioning_prompt_file or str(_CAPTIONING_PROMPT)
-    pnc_prompt = args.pnc_prompt_file or str(_PNC_PROMPT)
+    pnc_prompt = _resolve_pnc_prompt_file(
+        args.pnc_prompt_file,
+        use_indic_prompt=args.use_indic_pnc_prompt,
+    )
+    pnc_language_rules = None
+    if args.enable_pnc and "{language_rules}" in Path(pnc_prompt).read_text(encoding="utf-8"):
+        rules_file = args.pnc_language_rules_file or str(_PNC_LANGUAGE_RULES)
+        pnc_language_rules = load_pnc_language_rules(rules_file)
+        logger.info(
+            "PnC per-row language rules enabled from {} (codes={})",
+            rules_file,
+            sorted(pnc_language_rules),
+        )
     language_id_prompt = args.language_id_prompt_file or str(_LANGUAGE_ID_PROMPT)
     context_asr_prompt = args.context_asr_prompt_file or str(_CONTEXT_ASR_PROMPT)
     code_switching_prompt = args.code_switching_prompt_file or str(_CODE_SWITCHING_PROMPT)
@@ -928,6 +966,7 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
             text_stage_cls(
                 name="PnCRestoration",
                 prompt_file=pnc_prompt,
+                language_rules=pnc_language_rules,
                 text_key=pnc_input_key,
                 output_text_key=args.pnc_output_key,
                 **shared_model_kwargs,

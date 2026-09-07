@@ -170,6 +170,10 @@ class TextLLMStage(ProcessingStage[AudioTask, AudioTask]):
         model_id: HuggingFace model identifier.
         prompt_text: System prompt string (takes precedence over prompt_file).
         prompt_file: Path to a file containing the system prompt.
+        language_rules: Optional source-language-code to prompt-fragment map.
+            It is used only when the prompt contains ``{language_rules}``.
+        source_lang_key: Task field holding the language code used to resolve
+            ``{language}`` and ``{language_rules}``.
         text_key: Input field to read text from.
         output_text_key: Output field to write the result to.
         skip_me_key: Field that flags entries to skip.
@@ -189,6 +193,8 @@ class TextLLMStage(ProcessingStage[AudioTask, AudioTask]):
     model_id: str = "Qwen/Qwen3.5-35B-A3B-FP8"
     prompt_text: str | None = None
     prompt_file: str | None = None
+    language_rules: dict[str, str] | None = None
+    source_lang_key: str = "source_lang"
     text_key: str = "pnc_text"
     output_text_key: str = "output_text"
     skip_me_key: str = "_skipme"
@@ -225,6 +231,17 @@ class TextLLMStage(ProcessingStage[AudioTask, AudioTask]):
         tp = self.tensor_parallel_size
         if tp and tp > 0:
             self.resources = Resources(gpus=float(tp))
+        if self.language_rules is not None:
+            if not isinstance(self.language_rules, dict):
+                message = "language_rules must be a dictionary or None"
+                raise TypeError(message)
+            for code, rule in self.language_rules.items():
+                if not isinstance(code, str) or not code.strip():
+                    message = "language_rules contains an empty or non-string language code"
+                    raise ValueError(message)
+                if not isinstance(rule, str) or not rule.strip():
+                    message = f"language_rules[{code!r}] must be a non-empty string"
+                    raise ValueError(message)
 
     def num_workers(self) -> int | None:
         return self.num_workers_override
@@ -294,22 +311,56 @@ class TextLLMStage(ProcessingStage[AudioTask, AudioTask]):
     # ── I/O contract ─────────────────────────────────────────────────
 
     def inputs(self) -> tuple[list[str], list[str]]:
-        return [], [self.text_key, self.skip_me_key]
+        required = [self.text_key, self.skip_me_key]
+        if self.language_rules is not None:
+            required.append(self.source_lang_key)
+        return [], required
 
     def outputs(self) -> tuple[list[str], list[str]]:
         return [], [self.output_text_key]
 
     # ── Prompt formatting ────────────────────────────────────────────
 
-    def _format_prompt(self, user_text: str, task_data: dict | None = None) -> str:
+    def _render_prompt_template(self, user_text: str, task_data: dict | None = None) -> str:
+        """Resolve row-scoped prompt placeholders without cross-language leakage."""
+
         prompt_template = self._system_prompt
+        raw_language = task_data.get(self.source_lang_key) if task_data else None
+
+        if "{language_rules}" in prompt_template:
+            if raw_language is None or not str(raw_language).strip():
+                message = (
+                    f"{self.name}: prompt requires {{language_rules}} but task field "
+                    f"{self.source_lang_key!r} is missing or empty"
+                )
+                raise ValueError(message)
+            language_code = str(raw_language).strip().lower()
+            if self.language_rules is None:
+                message = f"{self.name}: prompt requires {{language_rules}} but no mapping was configured"
+                raise ValueError(message)
+            language_rule = self.language_rules.get(language_code)
+            if language_rule is None:
+                supported = ", ".join(sorted(self.language_rules))
+                message = (
+                    f"{self.name}: unsupported {self.source_lang_key}={raw_language!r}; "
+                    f"supported codes: {supported}"
+                )
+                raise ValueError(message)
+            prompt_template = prompt_template.replace("{language_rules}", language_rule)
 
         if "{language}" in prompt_template:
-            lang = task_data.get("source_lang", "English") if task_data else "English"
+            lang = str(raw_language).strip() if raw_language is not None and str(raw_language).strip() else "English"
             prompt_template = prompt_template.replace("{language}", lang)
 
         if "{text}" in prompt_template:
             prompt_template = prompt_template.replace("{text}", user_text)
+        return prompt_template
+
+    def _format_prompt(self, user_text: str, task_data: dict | None = None) -> str:
+        embeds_text = "{text}" in self._system_prompt
+        prompt_template = self._render_prompt_template(user_text, task_data)
+
+        if embeds_text:
             messages = [{"role": "user", "content": prompt_template}]
         else:
             messages = [
