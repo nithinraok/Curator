@@ -131,6 +131,8 @@ class RecoverEntitiesStage(ProcessingStage[AudioTask, AudioTask]):
     notes_key: str = "additional_notes"
     tensor_parallel_size: int | None = None
     max_output_tokens: int = 1024
+    temperature: float = 0.0
+    top_p: float = 1.0
     max_model_len: int = 4096
     max_num_seqs: int = 64
     gpu_memory_utilization: float = 0.95
@@ -185,7 +187,11 @@ class RecoverEntitiesStage(ProcessingStage[AudioTask, AudioTask]):
             gpu_memory_utilization=self.gpu_memory_utilization,
             kv_cache_dtype=self.kv_cache_dtype,
         )
-        self._sampling_params = SamplingParams(temperature=0, max_tokens=self.max_output_tokens)
+        self._sampling_params = SamplingParams(
+            temperature=self.temperature,
+            top_p=self.top_p,
+            max_tokens=self.max_output_tokens,
+        )
         logger.info(
             "%s: ready (system_prompt=%d chars, output_key=%s)",
             self.name,

@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import zlib
 from functools import reduce
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -109,15 +110,24 @@ _DISAGG_NIXL_PORT_SEED = 20097
 
 
 def dynamo_runtime_env(model_config: DynamoVLLMModelConfig) -> dict[str, Any]:
-    """Merge the user's ``runtime_env`` with the Dynamo-vLLM package pin."""
-    return BaseModelConfig.merge_runtime_envs(DYNAMO_VLLM_RUNTIME_ENV, model_config.runtime_env or None)
+    """Build the worker runtime env, optionally reusing preinstalled packages.
+
+    ``install_runtime_dependencies=False`` is an explicit container-image
+    contract: the current Python environment must already provide compatible
+    Dynamo, vLLM, and Ray packages. It avoids Ray cloning the driver's entire
+    virtualenv for every runtime environment.
+    """
+    base = DYNAMO_VLLM_RUNTIME_ENV if model_config.install_runtime_dependencies else {}
+    return BaseModelConfig.merge_runtime_envs(base, model_config.runtime_env or None)
 
 
 def merge_model_runtime_envs(models: list[DynamoVLLMModelConfig]) -> dict[str, Any]:
     """Merge every model's ``runtime_env`` onto the Dynamo-vLLM pin for the shared frontend actor."""
     envs = [m.runtime_env for m in models if m.runtime_env]
     user_merged = reduce(BaseModelConfig.merge_runtime_envs, envs) if envs else None
-    return BaseModelConfig.merge_runtime_envs(DYNAMO_VLLM_RUNTIME_ENV, user_merged)
+    install_dependencies = any(m.install_runtime_dependencies for m in models)
+    base = DYNAMO_VLLM_RUNTIME_ENV if install_dependencies else {}
+    return BaseModelConfig.merge_runtime_envs(base, user_merged)
 
 
 def _async_scheduling_cli_flags(engine_kwargs: dict[str, Any]) -> list[str]:
@@ -282,25 +292,27 @@ def launch_replicas(  # noqa: PLR0913
         else:
             logger.info(f"Replica {replica_index}: single-node, {spec.total_gpus} GPU(s)")
 
+        replica_metrics_url = ""
         for node_rank in range(spec.nnodes):
-            worker_actors.append(
-                _launch_vllm_worker(
-                    model_config=model_config,
-                    base_env=base_env,
-                    pg=pg,
-                    spec=spec,
-                    replica_index=replica_index,
-                    node_rank=node_rank,
-                    master_addr=master_addr,
-                    namespace=namespace,
-                    request_plane=request_plane,
-                    event_plane=event_plane,
-                    runtime_dir=runtime_dir,
-                    actor_name_prefix=actor_name_prefix,
-                    router_mode=router_mode,
-                    router_kv_events=router_kv_events,
-                )
+            worker_actor, metrics_url = _launch_vllm_worker(
+                model_config=model_config,
+                base_env=base_env,
+                pg=pg,
+                spec=spec,
+                replica_index=replica_index,
+                node_rank=node_rank,
+                master_addr=master_addr,
+                namespace=namespace,
+                request_plane=request_plane,
+                event_plane=event_plane,
+                runtime_dir=runtime_dir,
+                actor_name_prefix=actor_name_prefix,
+                router_mode=router_mode,
+                router_kv_events=router_kv_events,
             )
+            worker_actors.append(worker_actor)
+            if node_rank == 0:
+                replica_metrics_url = metrics_url
 
         entries.append(
             {
@@ -310,6 +322,7 @@ def launch_replicas(  # noqa: PLR0913
                 "gpus_per_node": spec.per_node_gpus,
                 "multi_node": spec.is_multi_node,
                 "master_addr": master_addr,
+                "metrics_urls": [replica_metrics_url],
             }
         )
 
@@ -332,7 +345,7 @@ def _launch_vllm_worker(  # noqa: PLR0913
     actor_name_prefix: str,
     router_mode: str | None,
     router_kv_events: bool,
-) -> ManagedSubprocess:
+) -> tuple[ManagedSubprocess, str]:
     """Spawn one ``python -m dynamo.vllm`` actor, pinned to bundle *node_rank*.
 
     Rank 0 is the "real" worker (model registration + scheduler + KV events
@@ -401,7 +414,12 @@ def _launch_vllm_worker(  # noqa: PLR0913
     python_args += _async_scheduling_cli_flags(model_config.engine_kwargs)
 
     label = build_worker_actor_name(model_name, replica_index, node_rank, tp_size)
-    return ManagedSubprocess.spawn(
+    metrics_port_seed = 18081 + zlib.crc32(f"{component}:{replica_index}:{node_rank}".encode()) % 10000
+    metrics_port = get_free_port_in_bundle(pg, node_rank, metrics_port_seed)
+    worker_ip = get_bundle_node_ip(pg, node_rank)
+    worker_env = _worker_subprocess_env(base_env, runtime_dir)
+    worker_env["DYN_SYSTEM_PORT"] = str(metrics_port)
+    proc = ManagedSubprocess.spawn(
         label,
         pg,
         node_rank,
@@ -409,9 +427,10 @@ def _launch_vllm_worker(  # noqa: PLR0913
         python_args=python_args,
         runtime_dir=runtime_dir,
         actor_name_prefix=actor_name_prefix,
-        subprocess_env=_worker_subprocess_env(base_env, runtime_dir),
+        subprocess_env=worker_env,
         runtime_env=dynamo_runtime_env(model_config),
     )
+    return proc, f"http://{worker_ip}:{metrics_port}/metrics"
 
 
 def launch_disagg_replicas(  # noqa: PLR0913
@@ -565,7 +584,13 @@ def _launch_disagg_role(  # noqa: PLR0913
         python_args += _async_scheduling_cli_flags(engine_kwargs)
 
         label = build_worker_actor_name(model_name, i, 0, tp_size, role=role)
-        logger.info(f"Disagg {role} worker {i}: {spec.per_node_gpus} GPU(s), nixl_port={nixl_port}")
+        metrics_seed = 18081 + zlib.crc32(f"{component}:{role}:{worker_index}".encode()) % 10000
+        metrics_port = get_free_port_in_bundle(pg, 0, metrics_seed)
+        worker_ip = get_bundle_node_ip(pg, 0)
+        logger.info(
+            f"Disagg {role} worker {i}: {spec.per_node_gpus} GPU(s), "
+            f"nixl_port={nixl_port}, metrics_port={metrics_port}"
+        )
         proc = ManagedSubprocess.spawn(
             label,
             pg,
@@ -577,6 +602,7 @@ def _launch_disagg_role(  # noqa: PLR0913
             subprocess_env={
                 **_worker_subprocess_env(base_env, runtime_dir),
                 "VLLM_NIXL_SIDE_CHANNEL_PORT": str(nixl_port),
+                "DYN_SYSTEM_PORT": str(metrics_port),
                 "PYTHONHASHSEED": "0",
             },
             runtime_env=dynamo_runtime_env(model_config),
@@ -592,6 +618,7 @@ def _launch_disagg_role(  # noqa: PLR0913
                 "nnodes": 1,
                 "multi_node": False,
                 "master_addr": None,
+                "metrics_urls": [f"http://{worker_ip}:{metrics_port}/metrics"],
             }
         )
         worker_index += 1

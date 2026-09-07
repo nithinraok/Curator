@@ -71,6 +71,27 @@ class DynamoRouterConfig:
 
 
 @dataclass
+class DynamoAdmissionConfig:
+    """Opt-in queue admission for a shared Dynamo/vLLM deployment.
+
+    ``max_waiting_requests`` is the per-worker vLLM queue threshold that
+    triggers HTTP 429. ``max_concurrent_requests`` is the initial/hard ceiling
+    for the shared AIMD window.
+    """
+
+    max_waiting_requests: int
+    max_concurrent_requests: int = 8192
+
+    def __post_init__(self) -> None:
+        if self.max_waiting_requests < 0:
+            msg = "max_waiting_requests must be >= 0"
+            raise ValueError(msg)
+        if self.max_concurrent_requests < 1:
+            msg = "max_concurrent_requests must be >= 1"
+            raise ValueError(msg)
+
+
+@dataclass
 class DynamoVLLMModelConfig(BaseModelConfig):
     """Dynamo vLLM model config.
 
@@ -82,6 +103,7 @@ class DynamoVLLMModelConfig(BaseModelConfig):
     """
 
     engine_kwargs: dict[str, Any] = field(default_factory=dict)
+    install_runtime_dependencies: bool = True
     num_replicas: int = 1
     mode: Literal["aggregated", "disagg"] = "aggregated"
     prefill: DynamoRoleConfig | None = None
@@ -118,3 +140,4 @@ class DynamoServerConfig(BaseServerConfig):
     request_plane: str = DEFAULT_DYNAMO_REQUEST_PLANE
     event_plane: str = DEFAULT_DYNAMO_EVENT_PLANE
     router: DynamoRouterConfig = field(default_factory=DynamoRouterConfig)
+    admission: DynamoAdmissionConfig | None = None

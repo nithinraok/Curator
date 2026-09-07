@@ -128,6 +128,89 @@ _CODE_SWITCHING_PROMPT = _PROMPT_DIR / "code_switching_prompt.md"
 _SPEECH_QA_PROMPT = _PROMPT_DIR / "speech_qa_prompt.md"
 _LANGUAGE_ID_PROMPT = _PROMPT_DIR / "language_id_prompt.md"
 _RECOVER_ENTITIES_PROMPT = _PROMPT_DIR / "recover_entities_prompt.md"
+_SAMPLING_STAGE_KEYS = frozenset(
+    {
+        "recover_entities",
+        "pnc",
+        "language_id",
+        "tn",
+        "itn",
+        "itn_no_disfluencies",
+        "captioning",
+        "context_asr",
+        "code_switching",
+        "speech_qa",
+    }
+)
+
+
+def _parse_stage_sampling_config(value: str) -> dict[str, dict[str, float]]:
+    """Parse and validate per-stage temperature/top-p overrides."""
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as exc:
+        msg = f"Expected a JSON object, got invalid JSON: {exc}"
+        raise argparse.ArgumentTypeError(msg) from exc
+    if not isinstance(parsed, dict):
+        msg = f"Expected a JSON object, got {type(parsed).__name__}"
+        raise argparse.ArgumentTypeError(msg)
+
+    unknown_stages = set(parsed) - _SAMPLING_STAGE_KEYS
+    if unknown_stages:
+        msg = f"Unknown sampling stage(s): {', '.join(sorted(unknown_stages))}"
+        raise argparse.ArgumentTypeError(msg)
+
+    normalized: dict[str, dict[str, float]] = {}
+    for stage, config in parsed.items():
+        normalized[stage] = _normalize_stage_sampling_config(stage, config)
+    return normalized
+
+
+def _normalize_stage_sampling_config(stage: str, config: object) -> dict[str, float]:
+    """Validate and normalize one stage's sampling overrides."""
+    if not isinstance(config, dict):
+        msg = f"Sampling config for {stage!r} must be a JSON object"
+        raise argparse.ArgumentTypeError(msg)
+    unknown_fields = set(config) - {"temperature", "top_p"}
+    if unknown_fields:
+        msg = f"Unknown sampling field(s) for {stage!r}: {', '.join(sorted(unknown_fields))}"
+        raise argparse.ArgumentTypeError(msg)
+
+    normalized: dict[str, float] = {}
+    for field_name, field_value in config.items():
+        if isinstance(field_value, bool) or not isinstance(field_value, (int, float)):
+            msg = f"{stage}.{field_name} must be a number"
+            raise argparse.ArgumentTypeError(msg)
+        numeric_value = float(field_value)
+        if field_name == "temperature" and numeric_value < 0:
+            msg = f"{stage}.temperature must be >= 0"
+            raise argparse.ArgumentTypeError(msg)
+        if field_name == "top_p" and not 0 < numeric_value <= 1:
+            msg = f"{stage}.top_p must be in (0, 1]"
+            raise argparse.ArgumentTypeError(msg)
+        normalized[field_name] = numeric_value
+    return normalized
+
+
+def _resolve_stage_sampling(
+    args: argparse.Namespace,
+    stage: str,
+    *,
+    default_temperature: float | None = None,
+    default_top_p: float | None = None,
+) -> dict[str, float]:
+    """Resolve a stage override over its backwards-compatible defaults."""
+    if stage not in _SAMPLING_STAGE_KEYS:
+        msg = f"Unknown sampling stage: {stage!r}"
+        raise ValueError(msg)
+
+    resolved_default_temperature = args.temperature if default_temperature is None else default_temperature
+    resolved_default_top_p = args.top_p if default_top_p is None else default_top_p
+    return {
+        "temperature": resolved_default_temperature,
+        "top_p": resolved_default_top_p,
+        **args.stage_sampling_config.get(stage, {}),
+    }
 
 
 def _resolve_pnc_prompt_file(custom_prompt_file: str | None, *, use_indic_prompt: bool) -> str:
@@ -567,6 +650,50 @@ def _build_arg_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
     )
     ap.add_argument("--max_num_seqs", type=int, default=256)
     ap.add_argument("--max_output_tokens", type=int, default=512)
+    ap.add_argument(
+        "--temperature",
+        type=float,
+        default=0.0,
+        help="Sampling temperature for the generic text stages (default: deterministic 0.0).",
+    )
+    ap.add_argument(
+        "--top_p",
+        type=float,
+        default=1.0,
+        help="Nucleus-sampling probability for the generic text stages (default: 1.0).",
+    )
+    ap.add_argument(
+        "--stage_sampling_config",
+        type=_parse_stage_sampling_config,
+        default={},
+        metavar="JSON",
+        help=(
+            "Per-stage sampling overrides. Keys: recover_entities, pnc, language_id, tn, itn, "
+            "itn_no_disfluencies, captioning, context_asr, code_switching, speech_qa. Each value "
+            "may set temperature and/or top_p, for example "
+            '\'{"pnc":{"temperature":0},"speech_qa":{"temperature":0.7,"top_p":0.95}}\'. '
+            "Global --temperature/--top_p remain fallbacks for generic text stages."
+        ),
+    )
+    ap.add_argument(
+        "--speculative_config",
+        type=str,
+        default=None,
+        help=(
+            "Value forwarded verbatim to vLLM --speculative-config, for example "
+            '\'{"model":"google/gemma-4-31B-it-assistant","num_speculative_tokens":4}\'.'
+        ),
+    )
+    ap.add_argument(
+        "--reuse_current_dynamo_environment",
+        action="store_true",
+        help=(
+            "Skip Ray's isolated ai-dynamo[vllm] runtime-environment install and use the current "
+            "container Python environment. The image must already contain compatible Dynamo, vLLM, "
+            "and Ray packages. Useful for prebuilt production images and network filesystems where "
+            "cloning the full driver virtualenv is prohibitively slow."
+        ),
+    )
     ap.add_argument("--gpu_memory_utilization", type=float, default=0.95)
     ap.add_argument("--kv_cache_dtype", type=str, default="fp8")
     ap.add_argument("--num_workers", type=int, default=None, help="Explicit GPU worker count for Xenna.")
@@ -626,6 +753,15 @@ def _build_arg_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
         default=None,
         help="tensor_parallel_size for the server engine (default: auto = visible GPU count).",
     )
+    srv.add_argument(
+        "--inference_router_mode",
+        choices=["round_robin", "random", "kv", "direct"],
+        default=None,
+        help=(
+            "Dynamo frontend routing policy for every request to the shared model. None preserves "
+            "Dynamo's default (round-robin for aggregated serving); 'kv' enables cache-aware routing."
+        ),
+    )
     srv.add_argument("--inference_port", type=int, default=8000, help="Server HTTP port.")
     srv.add_argument(
         "--inference_max_concurrent_requests",
@@ -634,6 +770,21 @@ def _build_arg_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
         help="Max in-flight requests per stage actor (async client semaphore bound).",
     )
     srv.add_argument("--inference_request_timeout", type=int, default=120, help="Per-request timeout (seconds).")
+    srv.add_argument(
+        "--inference_queue_max_waiting_requests",
+        type=int,
+        default=None,
+        help=(
+            "Enable shared vLLM queue admission at this per-worker threshold. "
+            "Overload returns HTTP 429 and drives the model-wide AIMD window."
+        ),
+    )
+    srv.add_argument(
+        "--inference_admission_max_concurrent_requests",
+        type=int,
+        default=8192,
+        help="Initial and maximum shared AIMD concurrency (default: 8192).",
+    )
     srv.add_argument(
         "--inference_health_timeout",
         type=int,
@@ -747,6 +898,9 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
     if args.enable_recover_entities and not args.use_inference_server:
         msg = "--enable_recover_entities requires --use_inference_server (RecoverEntities runs on the Dynamo server)."
         raise ValueError(msg)
+    if args.inference_queue_max_waiting_requests is not None and not args.use_inference_server:
+        msg = "--inference_queue_max_waiting_requests requires --use_inference_server."
+        raise ValueError(msg)
 
     # ── Optional Dynamo inference server ─────────────────────────────
     # Two modes:
@@ -762,7 +916,13 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
         import torch
 
         from nemo_curator.core.client import RayClient
-        from nemo_curator.core.serve import DynamoServerConfig, DynamoVLLMModelConfig, InferenceServer
+        from nemo_curator.core.serve import (
+            DynamoAdmissionConfig,
+            DynamoRouterConfig,
+            DynamoServerConfig,
+            DynamoVLLMModelConfig,
+            InferenceServer,
+        )
 
         # Count GPUs without Ray (ray.available_resources() requires a running
         # cluster). torch.cuda honours CUDA_VISIBLE_DEVICES. Start the cluster
@@ -796,6 +956,8 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
             engine_kwargs["compilation_config"] = {"cache_dir": _compile_cache}
         if args.max_num_batched_tokens is not None:
             engine_kwargs["max_num_batched_tokens"] = args.max_num_batched_tokens
+        if args.speculative_config is not None:
+            engine_kwargs["speculative_config"] = args.speculative_config
         if args.language_model_only:
             # gemma-4 is multimodal; we only send text. LM-only skips the vision/audio towers
             # -> lighter, faster, stable load + no --disable_chunked_mm_input / mm-token constraint.
@@ -815,9 +977,21 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
             model_identifier=args.model_id,
             model_name=args.inference_served_model_name,
             engine_kwargs=engine_kwargs,
+            install_runtime_dependencies=not args.reuse_current_dynamo_environment,
             num_replicas=args.inference_max_replicas,
         )
-        backend_cfg = DynamoServerConfig()
+        router_cfg = DynamoRouterConfig(
+            mode=args.inference_router_mode.replace("_", "-") if args.inference_router_mode else None,
+        )
+        admission_cfg = (
+            DynamoAdmissionConfig(
+                max_waiting_requests=args.inference_queue_max_waiting_requests,
+                max_concurrent_requests=args.inference_admission_max_concurrent_requests,
+            )
+            if args.inference_queue_max_waiting_requests is not None
+            else None
+        )
+        backend_cfg = DynamoServerConfig(router=router_cfg, admission=admission_cfg)
 
         inference_server = InferenceServer(
             models=[model_cfg],
@@ -943,6 +1117,12 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
                     else args.num_workers
                 ),
                 batch_size=args.batch_size,
+                **_resolve_stage_sampling(
+                    args,
+                    "recover_entities",
+                    default_temperature=0.0,
+                    default_top_p=1.0,
+                ),
                 **{
                     **remote_kwargs,
                     **(
@@ -969,6 +1149,7 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
                 language_rules=pnc_language_rules,
                 text_key=pnc_input_key,
                 output_text_key=args.pnc_output_key,
+                **_resolve_stage_sampling(args, "pnc"),
                 **shared_model_kwargs,
             )
         )
@@ -985,6 +1166,7 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
             text_key=langid_text_key,
             output_text_key="llm_language_prediction",
             enable_validation=False,
+            **_resolve_stage_sampling(args, "language_id"),
             **shared_model_kwargs,
         )
         if use_fusing:
@@ -1008,6 +1190,7 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
             output_text_key=args.tn_output_key,
             enable_validation=not args.disable_tn_validation,
             validation_mode="tn",
+            **_resolve_stage_sampling(args, "tn"),
             **shared_model_kwargs,
         )
         # TN runs serially (before the fused stage) so tn_raw is available to the downstream
@@ -1026,6 +1209,7 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
             prompt_file=itn_prompt,
             text_key=itn_input_key,
             output_text_key=args.itn_output_key,
+            **_resolve_stage_sampling(args, "itn"),
             **shared_model_kwargs,
         )
         # Fuse only when reading pnc_text; tn_raw input runs post-fused.
@@ -1047,6 +1231,7 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
                 prompt_file=itn_prompt,
                 text_key=itn_input_key,
                 output_text_key=args.itn_output_key,
+                **_resolve_stage_sampling(args, "itn"),
                 **shared_model_kwargs,
             )
             # Same placement rule as the ITN block above.
@@ -1063,6 +1248,7 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
             text_key=args.itn_output_key,
             output_text_key=args.itn_no_disfluencies_output_key,
             max_deletion_ratio=0.5,
+            **_resolve_stage_sampling(args, "itn_no_disfluencies"),
             **shared_model_kwargs,
         )
         # DisfluencyRemoval reads itn_raw from the fused stage — must follow it.
@@ -1079,6 +1265,7 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
             text_key=post_tn_text_key,
             output_text_key=args.captioning_output_key,
             enable_validation=False,
+            **_resolve_stage_sampling(args, "captioning"),
             **shared_model_kwargs,
         )
         if use_fusing:
@@ -1111,12 +1298,23 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
                 max_num_seqs=args.max_num_seqs,
                 gpu_memory_utilization=args.gpu_memory_utilization,
                 kv_cache_dtype=args.kv_cache_dtype,
-                num_workers_override=args.context_asr_num_workers if args.context_asr_num_workers is not None else args.num_workers,
+                num_workers_override=args.context_asr_num_workers
+                if args.context_asr_num_workers is not None
+                else args.num_workers,
                 batch_size=args.batch_size,
+                **_resolve_stage_sampling(
+                    args,
+                    "context_asr",
+                    default_temperature=0.1,
+                    default_top_p=0.95,
+                ),
                 **{
                     **remote_kwargs,
-                    **({"max_concurrent_requests": args.context_asr_max_concurrent_requests}
-                       if args.context_asr_max_concurrent_requests is not None and remote_kwargs else {}),
+                    **(
+                        {"max_concurrent_requests": args.context_asr_max_concurrent_requests}
+                        if args.context_asr_max_concurrent_requests is not None and remote_kwargs
+                        else {}
+                    ),
                 },
             )
         )
@@ -1168,6 +1366,7 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
             text_key=post_tn_text_key,
             output_text_key=args.code_switching_output_key,
             enable_validation=False,
+            **_resolve_stage_sampling(args, "code_switching"),
             **shared_model_kwargs,
         )
         if use_fusing:
@@ -1183,6 +1382,7 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
             text_key=post_tn_text_key,
             output_text_key=args.speech_qa_output_key,
             enable_validation=False,
+            **_resolve_stage_sampling(args, "speech_qa"),
             **shared_model_kwargs,
         )
         if use_fusing:
@@ -1257,8 +1457,7 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
             except Exception:
                 failed_batches += 1
                 logger.exception(
-                    f"Batch {_bi + 1}/{len(shard_batches)} failed; continuing "
-                    "(incomplete shards resume on re-run)."
+                    f"Batch {_bi + 1}/{len(shard_batches)} failed; continuing (incomplete shards resume on re-run)."
                 )
                 continue
             # Batch drained cleanly → finalize .done deterministically for its shards.

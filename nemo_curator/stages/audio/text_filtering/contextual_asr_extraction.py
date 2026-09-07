@@ -261,6 +261,8 @@ class ContextualASRExtractionStage(ProcessingStage[AudioTask, AudioTask]):
     notes_key: str = "additional_notes"
     tensor_parallel_size: int | None = None
     max_output_tokens: int = 2048
+    temperature: float = 0.1
+    top_p: float = 0.95
     max_model_len: int = 8192
     max_num_seqs: int = 16
     gpu_memory_utilization: float = 0.95
@@ -319,8 +321,8 @@ class ContextualASRExtractionStage(ProcessingStage[AudioTask, AudioTask]):
             kv_cache_dtype=self.kv_cache_dtype,
         )
         self._sampling_params = SamplingParams(
-            temperature=0.1,
-            top_p=0.95,
+            temperature=self.temperature,
+            top_p=self.top_p,
             max_tokens=self.max_output_tokens,
         )
 

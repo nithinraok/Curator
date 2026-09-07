@@ -80,6 +80,7 @@ vllm = ["vllm>=0.14.1; (platform_machine == 'x86_64' and platform_system != 'Dar
 
 # Inference Server (Ray Serve + vLLM) - for serving LLMs alongside Curator pipelines
 inference_server = [
+    "aiohttp>=3.13.3", # Dynamo admission gateway
     "nemo_curator[cuda12]",
     "nemo_curator[vllm]",
     "vllm<0.19; (platform_machine == 'x86_64' and platform_system != 'Darwin')", # Ray Serve LLM 2.55.1 isn't compatible with vllm 0.19+

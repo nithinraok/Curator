@@ -5334,6 +5334,7 @@ image-cuda12 = [
 ]
 inference-server = [
     { name = "ai-dynamo", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
+    { name = "aiohttp" },
     { name = "boto3" },
     { name = "gpustat" },
     { name = "nixl-cu12", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
@@ -5413,6 +5414,7 @@ sdg-cpu = [
 ]
 sdg-cuda12 = [
     { name = "ai-dynamo", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
+    { name = "aiohttp" },
     { name = "boto3" },
     { name = "data-designer" },
     { name = "gpustat" },
@@ -5565,6 +5567,7 @@ requires-dist = [
     { name = "absl-py", specifier = ">=2.0.0,<3.0.0" },
     { name = "accelerate", marker = "extra == 'audio-common'" },
     { name = "ai-dynamo", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin' and extra == 'inference-server'", specifier = "==1.1.0" },
+    { name = "aiohttp", marker = "extra == 'inference-server'", specifier = ">=3.13.3" },
     { name = "aiohttp", marker = "extra == 'translation-nmt'", specifier = ">=3.13.3" },
     { name = "albumentations", marker = "extra == 'interleaved-cpu'" },
     { name = "av", marker = "extra == 'video-cpu'", specifier = "==13.1.0" },

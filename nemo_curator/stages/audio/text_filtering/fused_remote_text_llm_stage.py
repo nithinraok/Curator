@@ -122,8 +122,8 @@ class FusedRemoteTextLLMStage(ProcessingStage["AudioTask", "AudioTask"]):
 
         for sub in self.sub_stages:
             self._gen_configs[sub.name] = GenerationConfig(
-                temperature=0.0,
-                top_p=1.0,
+                temperature=sub.temperature,
+                top_p=sub.top_p,
                 max_tokens=sub.max_output_tokens,
                 seed=0,
                 extra_kwargs={"extra_body": {"chat_template_kwargs": {"enable_thinking": False}}},

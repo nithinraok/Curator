@@ -96,10 +96,9 @@ class RemoteContextualASRExtractionStage(ContextualASRExtractionStage):
         # to a since-closed loop — a silent, timeout-immune hang.
         self._loop_runner = PersistentEventLoop(name=self.name)
         self._loop_runner.start()
-        # Matches the local SamplingParams(temperature=0.1, top_p=0.95).
         self._gen_config = GenerationConfig(
-            temperature=0.1,
-            top_p=0.95,
+            temperature=self.temperature,
+            top_p=self.top_p,
             max_tokens=self.max_output_tokens,
             extra_kwargs={"extra_body": {"chat_template_kwargs": {"enable_thinking": False}}},
         )
