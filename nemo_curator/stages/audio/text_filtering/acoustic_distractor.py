@@ -22,8 +22,8 @@ phonetically-confusable words.
 
 For each entity in ``fine_context_terms``:
 
-1. G2P the full phrase via :mod:`phonemizer` (espeak-ng backend) into an
-   IPA phoneme token list.
+1. G2P the full phrase via a configured permissive backend into a phone
+   token list.
 2. Compute Normalized Phonetic Distance (NPD)
    ``editdistance(query, candidate) / len(query)`` against every entry in
    a precomputed phoneme vocabulary loaded at ``setup()``.
@@ -40,33 +40,38 @@ appended to ``distractor_terms``.  The combined list is then capped at
 
 The precomputed phoneme vocabulary is produced offline by
 ``scripts/build_phoneme_vocab.py``.  Build it once per target language.
-``phoneme_vocab_path`` may point either at a single ``{word: [phonemes]}``
-JSON file (one language, used for every sample) or at a **directory** of
-``phoneme_vocab_<lang>.json`` files — in directory mode every file is loaded
-and the per-sample ``source_lang`` selects the matching vocab, so a single
-stage instance can serve a multi-language job.
+``phoneme_vocab_path`` may point either at a single JSON file (one language,
+used for every sample) or at a **directory** of ``phoneme_vocab_<lang>.json``
+files — in directory mode every file is loaded and the per-sample
+``source_lang`` selects the matching vocab, so a single stage instance can
+serve a multi-language job.  New vocab files include metadata describing the
+backend/language used to build them; legacy plain ``{word: [phones]}`` files
+are still accepted and use the stage-level backend settings.
 
 This stage is CPU-only — no GPU or LLM is required at runtime.
 
 Language handling
 -----------------
-The stage needs an espeak-ng language code to G2P entities.  In order
+The stage needs a language to G2P entities.  In order
 of precedence:
 
-1. ``language`` (if set on the stage) — used for all samples.
-2. ``source_lang`` from the manifest (display name like ``"English"``
-   or ISO-639-1 code like ``"en"``) — mapped to an espeak code.
-3. ``default_source_lang`` — used when neither of the above resolves.
+1. Vocab metadata, when present.
+2. ``language`` (if set on the stage) — used for all samples.
+3. ``source_lang`` from the manifest (display name like ``"English"``
+   or ISO-639-1 code like ``"en"``).
+4. ``default_source_lang`` — used when neither of the above resolves.
 
-When a sample's language cannot be mapped to a supported espeak code,
+When a sample's language cannot be mapped to a supported G2P language,
 the stage records ``unsupported_language`` in the additional_notes and
 leaves the existing ``distractor_terms`` untouched.
 
 Dependencies
 ------------
-- ``phonemizer`` (``pip install phonemizer``)
-- ``espeak-ng`` system package (``apt install espeak-ng``)
 - ``editdistance`` (already a transitive project dependency)
+- Optional G2P backends: Montreal Forced Aligner CLI + CC-BY G2P models,
+  ``phonikud``, ``g2p-en``, ``pypinyin``, NRC-ILT ``g2p``, ``epitran``, or
+  ``segments``.  The built-in ``rules`` backend provides approximate fallback
+  coverage for all target languages.
 """
 
 from __future__ import annotations
@@ -81,20 +86,19 @@ from loguru import logger
 if TYPE_CHECKING:
     from nemo_curator.backends.base import NodeInfo, WorkerMetadata
 
-from nemo_curator.stages.audio.pipeline_utils import LANG_CODE_TO_NAME, set_note
+from nemo_curator.stages.audio.pipeline_utils import set_note
+from nemo_curator.stages.audio.text_filtering.g2p_backend import (
+    BaseG2PBackend,
+    G2PBackendConfig,
+    G2PError,
+    build_g2p_config,
+    build_g2p_config_from_metadata,
+    make_g2p_backend,
+    normalize_g2p_language,
+)
 from nemo_curator.stages.base import ProcessingStage
 from nemo_curator.stages.resources import Resources
 from nemo_curator.tasks import AudioTask
-
-try:
-    from phonemizer import phonemize as _phonemize
-    from phonemizer.separator import Separator as _Separator
-
-    PHONEMIZER_AVAILABLE = True
-except ImportError:
-    PHONEMIZER_AVAILABLE = False
-    _phonemize = None  # type: ignore[assignment]
-    _Separator = None  # type: ignore[assignment]
 
 try:
     import editdistance as _editdistance
@@ -105,86 +109,11 @@ except ImportError:
     _editdistance = None  # type: ignore[assignment]
 
 
-# Display-name → espeak-ng language code.  Covers the 32 languages
-# supported by the design (see ``plan/acoustic_distractors_plan.md``).
-_LANG_TO_ESPEAK: dict[str, str] = {
-    "Arabic": "ar",
-    "Bulgarian": "bg",
-    "Chinese": "cmn",
-    "Croatian": "hr",
-    "Czech": "cs",
-    "Danish": "da",
-    "Dutch": "nl",
-    "English": "en-us",
-    "Estonian": "et",
-    "Finnish": "fi",
-    "French": "fr-fr",
-    "German": "de",
-    "Greek": "el",
-    "Hebrew": "he",
-    "Hindi": "hi",
-    "Hungarian": "hu",
-    "Italian": "it",
-    "Japanese": "ja",
-    "Korean": "ko",
-    "Latvian": "lv",
-    "Lithuanian": "lt",
-    "Maltese": "mt",
-    "Polish": "pl",
-    "Portuguese": "pt",
-    "Romanian": "ro",
-    "Russian": "ru",
-    "Slovak": "sk",
-    "Slovenian": "sl",
-    "Spanish": "es",
-    "Swedish": "sv",
-    "Thai": "th",
-    "Ukrainian": "uk",
-}
-
-_WORD_BOUNDARY_MARKER = "|"
-
-
-def _normalize_lang_to_espeak(value: Any) -> str | None:  # noqa: ANN401
-    """Map a manifest ``source_lang`` value to an espeak-ng language code.
-
-    Accepts either a display name (``"English"``) or an ISO-639-1 code
-    (``"en"``).  Returns ``None`` when no mapping is known.
-    """
-    if not value:
-        return None
-    text = str(value).strip()
-    if not text:
-        return None
-    if text in _LANG_TO_ESPEAK:
-        return _LANG_TO_ESPEAK[text]
-    title = text.title()
-    if title in _LANG_TO_ESPEAK:
-        return _LANG_TO_ESPEAK[title]
-    display = LANG_CODE_TO_NAME.get(text.lower())
-    if display and display in _LANG_TO_ESPEAK:
-        return _LANG_TO_ESPEAK[display]
-    return None
-
-
-def _phonemize_one(text: str, language: str) -> list[str]:
-    """G2P a single string into a flat list of IPA phoneme tokens."""
-    if not text or _phonemize is None or _Separator is None:
-        return []
-    sep = _Separator(phone=" ", word=f" {_WORD_BOUNDARY_MARKER} ", syllable="")
-    ipa = _phonemize(
-        text,
-        backend="espeak",
-        language=language,
-        separator=sep,
-        strip=True,
-        preserve_punctuation=False,
-        with_stress=False,
-        njobs=1,
-    )
-    if isinstance(ipa, list):
-        ipa = ipa[0] if ipa else ""
-    return [tok for tok in ipa.split() if tok and tok != _WORD_BOUNDARY_MARKER]
+@dataclass
+class _VocabBundle:
+    items: list[tuple[str, list[str]]]
+    g2p_config: G2PBackendConfig | None
+    metadata: dict[str, Any]
 
 
 def _npd(query: list[str], candidate: list[str]) -> float:
@@ -218,7 +147,7 @@ def _vocab_search(  # noqa: PLR0913
 
     hits: list[tuple[str, float]] = []
     for word, phonemes in vocab_items:
-        if word in excluded_words:
+        if word.lower() in excluded_words:
             continue
         if not (len_lo <= len(phonemes) <= len_hi):
             continue
@@ -254,10 +183,20 @@ class AcousticDistractorStage(ProcessingStage[AudioTask, AudioTask]):
             codes (``"en"``).
         default_source_lang: Fallback used when ``source_lang_key`` is
             missing or empty on a sample.
-        language: Optional explicit espeak-ng code (e.g. ``"en-us"``).
+        language: Optional explicit source language (e.g. ``"English"``,
+            ``"en"``, or a backend-specific code when ``g2p_backend`` is set).
             When set, used for all samples and the per-sample
             ``source_lang`` is ignored.  Use this when you know the
             entire dataset is a single language.
+        g2p_backend: Backend to use for legacy/plain vocab files or when
+            metadata does not pin a backend. ``"auto"`` prefers MFA when a
+            model path is provided, then Phonikud/g2p-en/pypinyin/NRC/Epitran,
+            and finally built-in approximate rules.
+        g2p_model_path: MFA G2P model path/name, or a directory containing
+            per-language MFA model archives. Used by the ``mfa`` backend.
+        segments_profile_path: CLDF segments profile path for the ``segments``
+            backend.
+        mfa_command: MFA CLI command name or path.
         phoneme_vocab_path: Path produced by ``scripts/build_phoneme_vocab.py``.
             Either a single ``{word: [phonemes]}`` JSON file (single-language,
             applied to all samples) or a directory of ``phoneme_vocab_<lang>.json``
@@ -284,6 +223,11 @@ class AcousticDistractorStage(ProcessingStage[AudioTask, AudioTask]):
     source_lang_key: str = "source_lang"
     default_source_lang: str = "English"
     language: str | None = None
+    g2p_backend: str = "auto"
+    g2p_model_path: str | None = None
+    segments_profile_path: str | None = None
+    mfa_command: str = "mfa"
+    mfa_num_jobs: int = 1
     phoneme_vocab_path: str = ""
     max_acoustic_distractors: int = 8
     max_total_distractors: int = 16
@@ -295,9 +239,18 @@ class AcousticDistractorStage(ProcessingStage[AudioTask, AudioTask]):
     resources: Resources = field(default_factory=lambda: Resources(cpus=1.0))
     batch_size: int = 256
 
-    _vocab_items: list[tuple[str, list[str]]] = field(default_factory=list, init=False, repr=False)
-    _vocab_by_lang: dict[str, list[tuple[str, list[str]]]] = field(default_factory=dict, init=False, repr=False)
-    _g2p_cache: dict[tuple[str, str], list[str]] = field(default_factory=dict, init=False, repr=False)
+    _single_vocab: _VocabBundle | None = field(default=None, init=False, repr=False)
+    _vocab_by_lang: dict[str, _VocabBundle] = field(default_factory=dict, init=False, repr=False)
+    _g2p_cache: dict[tuple[tuple[str, str, str | None, str | None, str], str], list[str]] = field(
+        default_factory=dict,
+        init=False,
+        repr=False,
+    )
+    _g2p_engines: dict[tuple[str, str, str | None, str | None, str], BaseG2PBackend] = field(
+        default_factory=dict,
+        init=False,
+        repr=False,
+    )
     _n_processed: int = field(default=0, init=False, repr=False)
     _n_appended: int = field(default=0, init=False, repr=False)
 
@@ -318,12 +271,6 @@ class AcousticDistractorStage(ProcessingStage[AudioTask, AudioTask]):
         pass
 
     def setup(self, _worker_metadata: WorkerMetadata | None = None) -> None:
-        if not PHONEMIZER_AVAILABLE:
-            msg = (
-                "phonemizer is required for AcousticDistractorStage. "
-                "Install it with `pip install phonemizer` and the espeak-ng system package."
-            )
-            raise ImportError(msg)
         if not EDITDISTANCE_AVAILABLE:
             msg = "editdistance is required for AcousticDistractorStage. `pip install editdistance`."
             raise ImportError(msg)
@@ -337,20 +284,15 @@ class AcousticDistractorStage(ProcessingStage[AudioTask, AudioTask]):
             raise FileNotFoundError(msg)
 
         if vocab_path.is_dir():
-            # Directory mode: load every ``phoneme_vocab_<lang>.json`` and key it
-            # by the espeak code that a sample of that language resolves to, so the
-            # per-sample ``source_lang`` selects the right vocab. Lets one stage
-            # instance serve a multi-language job. The filename code is the ISO
-            # code the file was built for (e.g. ``en`` → built with espeak ``en-us``),
-            # so it is normalised through the same map ``_resolve_language`` uses.
             files = sorted(vocab_path.glob("phoneme_vocab_*.json"))
             if not files:
                 msg = f"AcousticDistractorStage: no phoneme_vocab_*.json files in directory {vocab_path}"
                 raise FileNotFoundError(msg)
             for fpath in files:
                 code = fpath.stem[len("phoneme_vocab_") :]
-                espeak = _normalize_lang_to_espeak(code)
-                if not espeak:
+                bundle = self._load_vocab_bundle(fpath, language_hint=code)
+                lang_key = self._language_key_for_bundle(bundle, code)
+                if not lang_key:
                     logger.warning(
                         "%s: skipping vocab file with unmappable language code %r (%s)",
                         self.name,
@@ -358,14 +300,14 @@ class AcousticDistractorStage(ProcessingStage[AudioTask, AudioTask]):
                         fpath.name,
                     )
                     continue
-                items = self._load_vocab_file(fpath)
-                self._vocab_by_lang[espeak] = items
+                self._vocab_by_lang[lang_key] = bundle
                 logger.info(
-                    "%s: loaded %d entries for %s (espeak=%s) from %s",
+                    "%s: loaded %d entries for %s (backend=%s, language=%s) from %s",
                     self.name,
-                    len(items),
+                    len(bundle.items),
                     code,
-                    espeak,
+                    bundle.g2p_config.backend if bundle.g2p_config else self.g2p_backend,
+                    bundle.g2p_config.language if bundle.g2p_config else lang_key,
                     fpath.name,
                 )
             if not self._vocab_by_lang:
@@ -378,28 +320,137 @@ class AcousticDistractorStage(ProcessingStage[AudioTask, AudioTask]):
                 ",".join(sorted(self._vocab_by_lang)),
             )
         else:
-            self._vocab_items = self._load_vocab_file(vocab_path)
+            self._single_vocab = self._load_vocab_bundle(vocab_path, language_hint=self.language)
             logger.info(
                 "%s: loaded %d phoneme vocab entries from %s (language=%s)",
                 self.name,
-                len(self._vocab_items),
+                len(self._single_vocab.items),
                 vocab_path,
                 self.language or "(per-sample source_lang)",
             )
 
-    @staticmethod
-    def _load_vocab_file(path: Path) -> list[tuple[str, list[str]]]:
-        """Load one ``{word: [phonemes]}`` JSON into a filtered item list."""
+        for bundle in [*self._vocab_by_lang.values(), *([self._single_vocab] if self._single_vocab else [])]:
+            if bundle.g2p_config is not None:
+                self._engine_for(bundle.g2p_config)
+
+    def _load_vocab_bundle(self, path: Path, *, language_hint: Any = None) -> _VocabBundle:  # noqa: ANN401
+        """Load one vocab JSON into a filtered item list plus optional metadata."""
         with path.open("r", encoding="utf-8") as fh:
             raw = json.load(fh)
         if not isinstance(raw, dict):
-            msg = f"Phoneme vocab must be a JSON object mapping word→[phonemes]; got {type(raw).__name__} ({path})."
+            msg = f"Phoneme vocab must be a JSON object; got {type(raw).__name__} ({path})."
             raise TypeError(msg)
-        return [
+        metadata: dict[str, Any] = {}
+        vocab_raw: Any = raw
+        if isinstance(raw.get("vocab"), dict):
+            metadata = raw.get("metadata") if isinstance(raw.get("metadata"), dict) else {}
+            vocab_raw = raw["vocab"]
+        if not isinstance(vocab_raw, dict):
+            msg = f"Phoneme vocab must map word to [phones]; got {type(vocab_raw).__name__} ({path})."
+            raise TypeError(msg)
+
+        g2p_config = None
+        if metadata or language_hint or self.language:
+            g2p_config = build_g2p_config_from_metadata(
+                metadata,
+                language_hint=language_hint or self.language,
+                default_backend=self.g2p_backend,
+                g2p_model_path=self.g2p_model_path,
+                segments_profile_path=self.segments_profile_path,
+                mfa_command=self.mfa_command,
+                mfa_num_jobs=self.mfa_num_jobs,
+            )
+        items = [
             (str(word), [str(p) for p in phonemes])
-            for word, phonemes in raw.items()
+            for word, phonemes in vocab_raw.items()
             if isinstance(phonemes, list) and phonemes
         ]
+        return _VocabBundle(items=items, g2p_config=g2p_config, metadata=metadata)
+
+    @staticmethod
+    def _language_key_for_bundle(bundle: _VocabBundle, fallback: Any) -> str | None:  # noqa: ANN401
+        metadata = bundle.metadata
+        raw_language = metadata.get("source_language") or metadata.get("normalized_language") or fallback
+        if bundle.g2p_config and bundle.g2p_config.source_language:
+            raw_language = bundle.g2p_config.source_language
+        return normalize_g2p_language(raw_language)
+
+    def _default_g2p_config(self, language: str) -> G2PBackendConfig | None:
+        return build_g2p_config(
+            self.language or language,
+            backend=self.g2p_backend,
+            g2p_model_path=self.g2p_model_path,
+            segments_profile_path=self.segments_profile_path,
+            mfa_command=self.mfa_command,
+            mfa_num_jobs=self.mfa_num_jobs,
+        )
+
+    def _engine_for(self, config: G2PBackendConfig) -> BaseG2PBackend:
+        key = config.cache_key
+        engine = self._g2p_engines.get(key)
+        if engine is None:
+            engine = make_g2p_backend(config)
+            self._g2p_engines[key] = engine
+        return engine
+
+    def _resolve_language(self, task: AudioTask) -> str | None:
+        if self.language:
+            return normalize_g2p_language(self.language)
+        raw = task.data.get(self.source_lang_key) or self.default_source_lang
+        return normalize_g2p_language(raw)
+
+    def _vocab_bundle_for_language(self, language: str) -> _VocabBundle | None:
+        """Return the vocab bundle for ``language``."""
+        if self._vocab_by_lang:
+            return self._vocab_by_lang.get(language)
+        if self._single_vocab is None:
+            return None
+        if self._single_vocab.g2p_config is None:
+            self._single_vocab.g2p_config = self._default_g2p_config(language)
+        return self._single_vocab
+
+    def _g2p(self, text: str, config: G2PBackendConfig) -> list[str]:
+        key = (config.cache_key, text)
+        cached = self._g2p_cache.get(key)
+        if cached is not None:
+            return cached
+        try:
+            phonemes = self._engine_for(config).phonemize(text)
+        except G2PError as exc:
+            logger.warning("%s: G2P failed for %r (%s/%s): %s", self.name, text, config.backend, config.language, exc)
+            phonemes = []
+        self._g2p_cache[key] = phonemes
+        return phonemes
+
+    def _prewarm_g2p_cache(self, tasks: list[AudioTask]) -> None:
+        pending: dict[G2PBackendConfig, set[str]] = {}
+        for task in tasks:
+            extraction = task.data.get(self.context_key)
+            if not isinstance(extraction, dict):
+                continue
+            fine_terms = extraction.get("fine_context_terms") or []
+            if not isinstance(fine_terms, list) or not fine_terms:
+                continue
+            language = self._resolve_language(task)
+            if not language:
+                continue
+            bundle = self._vocab_bundle_for_language(language)
+            if bundle is None or bundle.g2p_config is None:
+                continue
+            for term in fine_terms:
+                text = str(term)
+                if (bundle.g2p_config.cache_key, text) not in self._g2p_cache:
+                    pending.setdefault(bundle.g2p_config, set()).add(text)
+
+        for config, texts_set in pending.items():
+            texts = sorted(texts_set)
+            try:
+                phoneme_lists = self._engine_for(config).phonemize_many(texts)
+            except G2PError as exc:
+                logger.warning("%s: batched G2P failed for %s/%s: %s", self.name, config.backend, config.language, exc)
+                phoneme_lists = [[] for _ in texts]
+            for text, phonemes in zip(texts, phoneme_lists, strict=True):
+                self._g2p_cache[(config.cache_key, text)] = phonemes
 
     def teardown(self) -> None:
         if self._n_processed:
@@ -417,44 +468,16 @@ class AcousticDistractorStage(ProcessingStage[AudioTask, AudioTask]):
     def outputs(self) -> tuple[list[str], list[str]]:
         return [], [self.context_key]
 
-    def _resolve_language(self, task: AudioTask) -> str | None:
-        if self.language:
-            return self.language
-        raw = task.data.get(self.source_lang_key) or self.default_source_lang
-        return _normalize_lang_to_espeak(raw)
-
-    def _vocab_for_language(self, language: str) -> list[tuple[str, list[str]]]:
-        """Return the vocab items for ``language``.
-
-        Directory mode: look up the per-language vocab (empty list if the
-        directory has no file for this language). Single-file mode: the one
-        loaded vocab is used for every sample (legacy single-language behaviour).
-        """
-        if self._vocab_by_lang:
-            return self._vocab_by_lang.get(language, [])
-        return self._vocab_items
-
-    def _g2p(self, text: str, language: str) -> list[str]:
-        key = (language, text)
-        cached = self._g2p_cache.get(key)
-        if cached is not None:
-            return cached
-        try:
-            phonemes = _phonemize_one(text, language)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("%s: phonemize failed for %r (%s): %s", self.name, text, language, exc)
-            phonemes = []
-        self._g2p_cache[key] = phonemes
-        return phonemes
-
     def _generate_acoustic_distractors(
         self,
         fine_terms: list[str],
         existing_distractors: list[str],
-        language: str,
-        vocab_items: list[tuple[str, list[str]]],
+        bundle: _VocabBundle,
     ) -> list[str]:
         """Return up to ``max_acoustic_distractors`` words from the vocab."""
+        vocab_items = bundle.items
+        if bundle.g2p_config is None:
+            return []
         if not fine_terms or not vocab_items:
             return []
 
@@ -462,7 +485,7 @@ class AcousticDistractorStage(ProcessingStage[AudioTask, AudioTask]):
 
         scored: dict[str, float] = {}
         for entity in fine_terms:
-            query = self._g2p(entity, language)
+            query = self._g2p(entity, bundle.g2p_config)
             if not query:
                 continue
             for word, dist in _vocab_search(
@@ -473,7 +496,7 @@ class AcousticDistractorStage(ProcessingStage[AudioTask, AudioTask]):
                 excluded_words=excluded,
                 top_k=self.per_entity_top_k,
             ):
-                if word in excluded:
+                if word.lower() in excluded:
                     continue
                 prev = scored.get(word)
                 if prev is None or dist < prev:
@@ -510,10 +533,13 @@ class AcousticDistractorStage(ProcessingStage[AudioTask, AudioTask]):
             set_note(task.data, self.name, "unsupported_language", self.notes_key)
             return
 
-        vocab_items = self._vocab_for_language(language)
-        if not vocab_items:
+        bundle = self._vocab_bundle_for_language(language)
+        if bundle is None:
             # Directory mode with no vocab file for this language.
             set_note(task.data, self.name, f"no_vocab_for_language:{language}", self.notes_key)
+            return
+        if bundle.g2p_config is None:
+            set_note(task.data, self.name, f"no_g2p_backend_for_language:{language}", self.notes_key)
             return
 
         raw_existing = extraction.get("distractor_terms") or []
@@ -522,8 +548,7 @@ class AcousticDistractorStage(ProcessingStage[AudioTask, AudioTask]):
         acoustic = self._generate_acoustic_distractors(
             [str(t) for t in fine_terms],
             existing,
-            language,
-            vocab_items,
+            bundle,
         )
 
         self._n_processed += 1
@@ -541,6 +566,7 @@ class AcousticDistractorStage(ProcessingStage[AudioTask, AudioTask]):
     def process_batch(self, tasks: list[AudioTask]) -> list[AudioTask]:
         if len(tasks) == 0:
             return []
+        self._prewarm_g2p_cache(tasks)
         for task in tasks:
             self._process_one(task)
         logger.debug("%s: batch of %d tasks", self.name, len(tasks))
