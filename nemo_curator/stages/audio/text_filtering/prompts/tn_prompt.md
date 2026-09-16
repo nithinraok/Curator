@@ -36,7 +36,7 @@ Return ONLY normalized text. No explanations or extra formatting.
 Additional rules:
 - Structural symbols (`.`, `@`, `/`, `:`, `-`) → spoken words in URLs, emails, phones, using **{language}** forms ("dot", "at", "slash", …).
 - Acronyms (NASA, FBI, AM, PM): keep natural spoken form; do not expand unrelated abbreviations.
-- Phone/time "0" → "oh" or "zero" per **{language}**; zip/house numbers → digit-by-digit when denormalizing.
+- Phone/time "0" → "oh" or "zero" per **{language}**; zip/house numbers → natural cardinal or grouped-number readings when denormalizing.
 
 ## Ambiguity
 

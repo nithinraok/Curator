@@ -102,6 +102,10 @@ from nemo_curator.stages.audio.text_filtering.remote_contextual_asr_extraction i
 from nemo_curator.stages.audio.text_filtering.remote_recover_entities import RemoteRecoverEntitiesStage
 from nemo_curator.stages.audio.text_filtering.remote_text_llm_stage import RemoteTextLLMStage
 from nemo_curator.stages.audio.text_filtering.text_llm_stage import TextLLMStage
+from nemo_curator.stages.audio.text_filtering.tn_language_examples import (
+    TN_LANGUAGE_CODES,
+    load_tn_language_examples,
+)
 from nemo_curator.stages.resources import Resources
 
 _PROMPT_DIR = (
@@ -114,6 +118,8 @@ _PROMPT_DIR = (
 )
 _ITN_PROMPT = _PROMPT_DIR / "itn_prompt.md"
 _TN_PROMPT = _PROMPT_DIR / "tn_prompt.md"
+_TN_INDIC_PROMPT = _PROMPT_DIR / "tn_prompt_indic.md"
+_TN_LANGUAGE_EXAMPLES = _PROMPT_DIR / "tn_language_examples.json"
 _CORRECTION_PROMPT = _PROMPT_DIR / "correction_prompt.md"
 _CAPTIONING_PROMPT = _PROMPT_DIR / "captioning_prompt.md"
 _PNC_PROMPT = _PROMPT_DIR / "pnc_prompt.md"
@@ -217,6 +223,23 @@ def _resolve_pnc_prompt_file(custom_prompt_file: str | None, *, use_indic_prompt
     if use_indic_prompt:
         return str(_PNC_INDIC_PROMPT)
     return custom_prompt_file or str(_PNC_PROMPT)
+
+
+def _resolve_tn_prompt_file(custom_prompt_file: str | None, *, use_indic_prompt: bool) -> str:
+    if use_indic_prompt:
+        return str(_TN_INDIC_PROMPT)
+    return custom_prompt_file or str(_TN_PROMPT)
+
+
+def _load_tn_language_examples_for_prompt(
+    *,
+    enabled: bool,
+    prompt_file: str,
+    examples_file: str | None,
+) -> dict[str, str] | None:
+    if not enabled or "{language_rules}" not in Path(prompt_file).read_text(encoding="utf-8"):
+        return None
+    return load_tn_language_examples(examples_file or _TN_LANGUAGE_EXAMPLES)
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
@@ -380,8 +403,26 @@ def _build_arg_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
     ap.add_argument(
         "--model_id", type=str, default="Qwen/Qwen3.5-35B-A3B-FP8", help="HuggingFace model ID for the text LLM."
     )
-    ap.add_argument(
+    tn_prompt_group = ap.add_mutually_exclusive_group()
+    tn_prompt_group.add_argument(
         "--tn_prompt_file", type=str, default=None, help="Path to TN prompt file. Defaults to bundled tn_prompt.md."
+    )
+    tn_prompt_group.add_argument(
+        "--use_indic_tn_prompt",
+        action="store_true",
+        help=(
+            "Use the bundled row-scoped Indic TN prompt with translated examples for 22 languages. "
+            f"Manifest rows must use an exact source_lang code: {', '.join(TN_LANGUAGE_CODES)}."
+        ),
+    )
+    ap.add_argument(
+        "--tn_language_examples_file",
+        type=str,
+        default=None,
+        help=(
+            "JSON mapping used to resolve the Indic TN prompt's {language_rules} placeholder. "
+            "Defaults to bundled tn_language_examples.json and is loaded only when the selected prompt uses the placeholder."
+        ),
     )
     ap.add_argument(
         "--itn_prompt_file", type=str, default=None, help="Path to ITN prompt file. Defaults to bundled itn_prompt.md."
@@ -902,6 +943,23 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
         msg = "--inference_queue_max_waiting_requests requires --use_inference_server."
         raise ValueError(msg)
 
+    tn_prompt = _resolve_tn_prompt_file(
+        args.tn_prompt_file,
+        use_indic_prompt=args.use_indic_tn_prompt,
+    )
+    examples_file = args.tn_language_examples_file or str(_TN_LANGUAGE_EXAMPLES)
+    tn_language_examples = _load_tn_language_examples_for_prompt(
+        enabled=args.enable_tn,
+        prompt_file=tn_prompt,
+        examples_file=examples_file,
+    )
+    if tn_language_examples is not None:
+        logger.info(
+            "TN per-row translated examples enabled from {} (codes={})",
+            examples_file,
+            sorted(tn_language_examples),
+        )
+
     # ── Optional Dynamo inference server ─────────────────────────────
     # Two modes:
     #   --use_inference_server -> start a local RayClient + NVIDIA Dynamo server
@@ -1021,7 +1079,6 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
     text_stage_cls = RemoteTextLLMStage if remote_base_url else TextLLMStage
     ctx_stage_cls = RemoteContextualASRExtractionStage if remote_base_url else ContextualASRExtractionStage
 
-    tn_prompt = args.tn_prompt_file or str(_TN_PROMPT)
     itn_prompt = args.itn_prompt_file or str(_ITN_PROMPT)
     itn_no_disfl_prompt = args.itn_no_disfluencies_prompt_file or str(_CORRECTION_PROMPT)
     captioning_prompt = args.captioning_prompt_file or str(_CAPTIONING_PROMPT)
@@ -1055,7 +1112,6 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
         "batch_size": args.batch_size,
         **remote_kwargs,
     }
-
     # When --fuse_stages is active, the parallel stages (LanguageID reads pnc_text;
     # Captioning/CodeSwitching/SpeechQA read tn_raw) are collected here and wrapped in
     # one FusedRemoteTextLLMStage actor. TN runs serially before the fused stage so its
@@ -1186,6 +1242,7 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
         _tn_stage = text_stage_cls(
             name="TextNormalization",
             prompt_file=tn_prompt,
+            language_rules=tn_language_examples,
             text_key=base_text_key,
             output_text_key=args.tn_output_key,
             enable_validation=not args.disable_tn_validation,
