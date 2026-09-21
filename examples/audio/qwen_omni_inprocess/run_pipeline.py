@@ -133,10 +133,17 @@ QWEN_OMNI_RECOMMENDED_LANGS = {
     "vi",
     "tr",
 }  # id/vi/tr → qwen_omni primary, qwen_asr recovery
+# NOTE: "ms" (Malay) removed from QWEN_OMNI_RECOMMENDED_LANGS → moved to WHISPER_QWEN_ASR_RECOVERY_LANGS.
 PARAKEET_V3_PRIMARY_LANGS = {"pl", "cs", "ro", "hu", "el", "fi", "da", "sv"}
 WHISPER_RECOMMENDED_LANGS = {"lt", "lv", "hr", "et", "bg", "sk", "sl", "mt", "uk", "he"}
-# Languages using Qwen3-ASR as primary with Whisper Large V3 as recovery (th/fil/fa).
-QWEN_ASR_PRIMARY_LANGS = frozenset({"th", "fil", "fa"})
+# Languages using Qwen3-ASR as primary with Whisper Large V3 as recovery (th/fa).
+# NOTE: "fil" removed → moved to WHISPER_QWEN_ASR_RECOVERY_LANGS (Whisper primary, Qwen3-ASR recovery).
+QWEN_ASR_PRIMARY_LANGS = frozenset({"th", "fa"})
+# Languages using Whisper Large V3 as primary with Qwen3-ASR as recovery.
+#   tl  (Tagalog)  → Whisper primary + Qwen3-ASR recovery
+#   fil (Filipino) → Whisper primary + Qwen3-ASR recovery  (reassigned from QWEN_ASR_PRIMARY_LANGS)
+#   ms  (Malay)    → Whisper primary + Qwen3-ASR recovery  (reassigned from QWEN_OMNI_RECOMMENDED_LANGS)
+WHISPER_QWEN_ASR_RECOVERY_LANGS = frozenset({"tl", "fil", "ms"})
 # Whisper-primary languages that take NO recovery model (Whisper Large V3 only). Hebrew has no
 # suitable second model, so it runs Whisper alone.
 WHISPER_NO_RECOVERY_LANGS = frozenset({"he"})
@@ -279,6 +286,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
             f"{sorted(QWEN_OMNI_RECOMMENDED_LANGS)} → primary=qwen_omni, recovery=qwen_asr; "
             f"{sorted(QWEN_ASR_PRIMARY_LANGS)} → primary=qwen_asr, recovery=whisper; "
             f"{sorted(PARAKEET_V3_PRIMARY_LANGS)} → primary=parakeet_v3, recovery=whisper; "
+            f"{sorted(WHISPER_QWEN_ASR_RECOVERY_LANGS)} → primary=whisper, recovery=qwen_asr; "
             f"{sorted(WHISPER_RECOMMENDED_LANGS - WHISPER_NO_RECOVERY_LANGS)} → primary=whisper, recovery=parakeet_v3; "
             f"{sorted(WHISPER_NO_RECOVERY_LANGS)} → primary=whisper, recovery=none."
         ),
@@ -692,6 +700,7 @@ def _resolve_language_flags(args: argparse.Namespace) -> None:  # noqa: C901
         | PARAKEET_V3_PRIMARY_LANGS
         | WHISPER_RECOMMENDED_LANGS
         | QWEN_ASR_PRIMARY_LANGS
+        | WHISPER_QWEN_ASR_RECOVERY_LANGS
         | INDIC_CANARY_SUPPORTED_LANGS
     )
     if lang not in all_known:
@@ -712,6 +721,9 @@ def _resolve_language_flags(args: argparse.Namespace) -> None:  # noqa: C901
             args.primary_model = "qwen_asr"
         elif lang in PARAKEET_V3_PRIMARY_LANGS:
             args.primary_model = "parakeet_v3"
+        elif lang in WHISPER_QWEN_ASR_RECOVERY_LANGS:
+            # tl/fil/ms: Whisper Large V3 primary + Qwen3-ASR recovery.
+            args.primary_model = "whisper"
         else:
             args.primary_model = "whisper"
     if not recovery_was_explicit:
@@ -720,6 +732,9 @@ def _resolve_language_flags(args: argparse.Namespace) -> None:  # noqa: C901
             args.recovery_model = _indic_recovery_for_language(lang)
         elif lang in QWEN_ASR_PRIMARY_LANGS:
             args.recovery_model = "whisper"
+        elif lang in WHISPER_QWEN_ASR_RECOVERY_LANGS:
+            # tl/fil/ms: override the default whisper→parakeet_v3 pairing → use Qwen3-ASR instead.
+            args.recovery_model = "qwen_asr"
         elif lang in WHISPER_NO_RECOVERY_LANGS:
             args.recovery_model = "none"
     logger.info(
