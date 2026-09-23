@@ -47,6 +47,7 @@ LANG_CODE_TO_NAME: dict[str, str] = {
     "zh": "Chinese", "ja": "Japanese", "ko": "Korean", "ar": "Arabic",
     "he": "Hebrew", "id": "Indonesian", "vi": "Vietnamese", "th": "Thai",
     "tr": "Turkish", "fil": "Filipino", "tl": "Tagalog", "fa": "Persian",
+    "ms": "Malay", "yue": "Cantonese",
 }
 
 INDIC_CONFORMER_LANGUAGE_CODES: frozenset[str] = frozenset({

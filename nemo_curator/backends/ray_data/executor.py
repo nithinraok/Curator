@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from typing import TYPE_CHECKING, Any
 
 import ray
@@ -66,9 +67,28 @@ class RayDataExecutor(BaseExecutor):
         try:
             # Initialize ray and explicitly set NOSET to empty
             # This ensures if Xenna was used before which was setting NOSET, we end up overriding it.
-            ray.init(
-                ignore_reinit_error=True, runtime_env={"env_vars": {"RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": ""}}
-            )
+            _ray_init_kwargs: dict[str, Any] = {
+                "ignore_reinit_error": True,
+                "runtime_env": {"env_vars": {"RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": ""}},
+            }
+            # Ray caps the plasma object store at ~200GiB (10% of RAM) by default and ignores
+            # RAY_DEFAULT_OBJECT_STORE_MEMORY_PROPORTION for the hard cap. On large-RAM nodes this
+            # starves Ray Data (the reader front-loads audio waveforms and saturates the store,
+            # backpressuring the GPU stages). Let the launcher raise it explicitly via
+            # NEMO_RAY_OBJECT_STORE_MEMORY_BYTES (must be <= container /dev/shm size).
+            _obj_store_bytes = os.environ.get("NEMO_RAY_OBJECT_STORE_MEMORY_BYTES", "").strip()
+            if _obj_store_bytes:
+                try:
+                    _ray_init_kwargs["object_store_memory"] = int(_obj_store_bytes)
+                    logger.info(
+                        f"Setting Ray object_store_memory={int(_obj_store_bytes) / 2**30:.0f}GiB "
+                        "from NEMO_RAY_OBJECT_STORE_MEMORY_BYTES"
+                    )
+                except ValueError:
+                    logger.warning(
+                        f"Ignoring invalid NEMO_RAY_OBJECT_STORE_MEMORY_BYTES={_obj_store_bytes!r} (not an int)"
+                    )
+            ray.init(**_ray_init_kwargs)
 
             # Convert tasks to dataset
             current_dataset = self._tasks_to_dataset(tasks)
