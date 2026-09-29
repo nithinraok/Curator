@@ -33,7 +33,15 @@ QWEN3_ASR_0_6B_LANGS: frozenset[str] = frozenset({
     "zh", "en", "yue", "ar", "de", "fr", "es", "pt", "id", "it",
     "ko", "ru", "th", "vi", "ja", "tr", "hi", "ms", "nl", "sv",
     "da", "fi", "pl", "cs", "fil", "fa", "el", "hu", "mk", "ro",
+    # Aliases resolved via QWEN3_ASR_LANG_ALIASES before this check:
+    "tl",  # Tagalog → treated as "fil" (Filipino) by the model
 })
+
+# ISO code aliases: these codes are normalised to their canonical model code
+# before the QWEN3_ASR_0_6B_LANGS eligibility check and language-name lookup.
+QWEN3_ASR_LANG_ALIASES: dict[str, str] = {
+    "tl": "fil",   # Tagalog ISO 639-1 → Filipino (Qwen3-ASR registers it as "Filipino")
+}
 
 
 @dataclass
@@ -188,6 +196,7 @@ class InferenceQwenASRStage(ProcessingStage[AudioTask, AudioTask]):
         for i in run_indices:
             if self.source_lang_key:
                 code = str(tasks[i].data.get(self.source_lang_key, "") or "").strip().lower()
+                code = QWEN3_ASR_LANG_ALIASES.get(code, code)  # e.g. "tl" → "fil"
                 if code not in QWEN3_ASR_0_6B_LANGS:
                     set_note(tasks[i].data, self.name, f"skipped (unsupported language: {code})", self.notes_key)
                     set_note(tasks[i].data, self.pred_text_key, f"lang_not_supported:{code}", self.notes_key)
@@ -210,8 +219,14 @@ class InferenceQwenASRStage(ProcessingStage[AudioTask, AudioTask]):
         languages: list[str | None] | None = None
         if self.source_lang_key:
             languages = [
-                _LANG_CODE_TO_NAME.get(code, code) if code else None
-                for code in (tasks[i].data.get(self.source_lang_key) for i in eligible_indices)
+                _LANG_CODE_TO_NAME.get(
+                    QWEN3_ASR_LANG_ALIASES.get(
+                        str(tasks[i].data.get(self.source_lang_key) or "").strip().lower(),
+                        str(tasks[i].data.get(self.source_lang_key) or "").strip().lower(),
+                    ),
+                    str(tasks[i].data.get(self.source_lang_key) or ""),
+                ) if tasks[i].data.get(self.source_lang_key) else None
+                for i in eligible_indices
             ]
 
         pred_texts, detected_langs = self._model.generate(waveforms, sample_rates, contexts, languages)
