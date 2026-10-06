@@ -78,6 +78,7 @@ class RemoteTextLLMStage(TextLLMStage):
     _loop_runner: Any = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
+        super().__post_init__()
         # Remote mode holds no in-process engine. Force CPU-only so the
         # executor schedules these client actors OFF the GPUs the server
         # occupies (asking for a GPU here would deadlock waiting for one
@@ -182,7 +183,7 @@ class RemoteTextLLMStage(TextLLMStage):
                 model=model,
                 generation_config=self._gen_config,
             )
-            return ((resp[0] if resp else None) or "").strip()   # server can return [None] for empty completions
+            return ((resp[0] if resp else None) or "").strip()  # server can return [None] for empty completions
 
         async def _all() -> list[str]:
             return await asyncio.gather(*[_one(m) for m in messages_list])
@@ -202,7 +203,7 @@ class RemoteTextLLMStage(TextLLMStage):
         valid_indices: list[int] = []
         messages_list: list[list[dict]] = []
 
-        for i, task in enumerate(tasks):
+        for i, task in self._source_language_enabled_tasks(tasks):
             text = task.data.get(self.text_key, "")
             skip = task.data.get(self.skip_me_key, "")
             if skip:
