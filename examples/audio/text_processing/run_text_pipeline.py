@@ -94,6 +94,10 @@ from nemo_curator.stages.audio.text_filtering.contextual_asr_extraction import C
 from nemo_curator.stages.audio.text_filtering.contextual_asr_prompt_variant import ContextualASRPromptVariantStage
 from nemo_curator.stages.audio.text_filtering.fused_remote_text_llm_stage import FusedRemoteTextLLMStage
 from nemo_curator.stages.audio.text_filtering.instruction_packer import InstructionPackerStage
+from nemo_curator.stages.audio.text_filtering.itn_language_examples import (
+    ITN_LANGUAGE_CODES,
+    load_itn_language_examples,
+)
 from nemo_curator.stages.audio.text_filtering.llm_language_verification import LLMLanguageVerificationStage
 from nemo_curator.stages.audio.text_filtering.pnc_language_rules import load_pnc_language_rules
 from nemo_curator.stages.audio.text_filtering.remote_contextual_asr_extraction import (
@@ -113,6 +117,8 @@ _PROMPT_DIR = (
     / "prompts"
 )
 _ITN_PROMPT = _PROMPT_DIR / "itn_prompt.md"
+_ITN_INDIC_PROMPT = _PROMPT_DIR / "itn_prompt_indic.md"
+_ITN_LANGUAGE_EXAMPLES = _PROMPT_DIR / "itn_language_examples.json"
 _TN_PROMPT = _PROMPT_DIR / "tn_prompt.md"
 _CORRECTION_PROMPT = _PROMPT_DIR / "correction_prompt.md"
 _CAPTIONING_PROMPT = _PROMPT_DIR / "captioning_prompt.md"
@@ -217,6 +223,36 @@ def _resolve_pnc_prompt_file(custom_prompt_file: str | None, *, use_indic_prompt
     if use_indic_prompt:
         return str(_PNC_INDIC_PROMPT)
     return custom_prompt_file or str(_PNC_PROMPT)
+
+
+def _resolve_itn_prompt_file(custom_prompt_file: str | None, *, use_indic_prompt: bool) -> str:
+    if use_indic_prompt:
+        return str(_ITN_INDIC_PROMPT)
+    return custom_prompt_file or str(_ITN_PROMPT)
+
+
+def _load_itn_language_examples_for_prompt(
+    *,
+    enabled: bool,
+    prompt_file: str,
+    examples_file: str | None,
+) -> dict[str, str] | None:
+    if not enabled or "{language_rules}" not in Path(prompt_file).read_text(encoding="utf-8"):
+        return None
+    return load_itn_language_examples(examples_file or _ITN_LANGUAGE_EXAMPLES)
+
+
+def _append_fused_stage_sequence(
+    stages: list,
+    *,
+    fused_stage: object | None,
+    post_fused_stages: list,
+) -> None:
+    """Append an optional fused actor followed by every dependent serial stage."""
+
+    if fused_stage is not None:
+        stages.append(fused_stage)
+    stages.extend(post_fused_stages)
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
@@ -383,8 +419,27 @@ def _build_arg_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
     ap.add_argument(
         "--tn_prompt_file", type=str, default=None, help="Path to TN prompt file. Defaults to bundled tn_prompt.md."
     )
-    ap.add_argument(
+    itn_prompt_group = ap.add_mutually_exclusive_group()
+    itn_prompt_group.add_argument(
         "--itn_prompt_file", type=str, default=None, help="Path to ITN prompt file. Defaults to bundled itn_prompt.md."
+    )
+    itn_prompt_group.add_argument(
+        "--use_indic_itn_prompt",
+        action="store_true",
+        help=(
+            "Use the bundled row-scoped Indic ITN prompt with translated examples for 22 languages. "
+            f"Manifest rows must use a supported source_lang code: {', '.join(ITN_LANGUAGE_CODES)}."
+        ),
+    )
+    ap.add_argument(
+        "--itn_language_examples_file",
+        type=str,
+        default=None,
+        help=(
+            "JSON mapping used to resolve the Indic ITN prompt's {language_rules} placeholder. "
+            "Defaults to bundled itn_language_examples.json and is loaded only when the selected prompt uses the "
+            "placeholder."
+        ),
     )
     ap.add_argument(
         "--itn_no_disfluencies_prompt_file",
@@ -902,6 +957,29 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
         msg = "--inference_queue_max_waiting_requests requires --use_inference_server."
         raise ValueError(msg)
 
+    itn_enabled = args.enable_itn or args.enable_itn_no_disfluencies
+    itn_prompt = _resolve_itn_prompt_file(
+        args.itn_prompt_file,
+        use_indic_prompt=args.use_indic_itn_prompt,
+    )
+    itn_examples_file = args.itn_language_examples_file or str(_ITN_LANGUAGE_EXAMPLES)
+    itn_language_examples = _load_itn_language_examples_for_prompt(
+        enabled=itn_enabled,
+        prompt_file=itn_prompt,
+        examples_file=itn_examples_file,
+    )
+    if itn_language_examples is not None:
+        logger.info(
+            "ITN per-row translated examples enabled from {} (codes={})",
+            itn_examples_file,
+            sorted(itn_language_examples),
+        )
+        logger.warning(
+            "Generic ITN output validation is disabled for row-scoped language examples because valid numeric and "
+            "structural compaction is incompatible with its word-count heuristic; use downstream and native-language "
+            "QA until a language-aware validator is available."
+        )
+
     # ── Optional Dynamo inference server ─────────────────────────────
     # Two modes:
     #   --use_inference_server -> start a local RayClient + NVIDIA Dynamo server
@@ -1022,7 +1100,6 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
     ctx_stage_cls = RemoteContextualASRExtractionStage if remote_base_url else ContextualASRExtractionStage
 
     tn_prompt = args.tn_prompt_file or str(_TN_PROMPT)
-    itn_prompt = args.itn_prompt_file or str(_ITN_PROMPT)
     itn_no_disfl_prompt = args.itn_no_disfluencies_prompt_file or str(_CORRECTION_PROMPT)
     captioning_prompt = args.captioning_prompt_file or str(_CAPTIONING_PROMPT)
     pnc_prompt = _resolve_pnc_prompt_file(
@@ -1203,12 +1280,18 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
             not args.disable_tn_validation,
         )
 
-    if args.enable_itn:
+    if itn_enabled:
+        if args.enable_itn_no_disfluencies and not args.enable_itn:
+            logger.warning(
+                "--enable_itn_no-disfluencies requires --enable_itn (needs itn_raw as input). Enabling ITN automatically."
+            )
         _itn_stage = text_stage_cls(
             name="ITNRestoration",
             prompt_file=itn_prompt,
+            language_rules=itn_language_examples,
             text_key=itn_input_key,
             output_text_key=args.itn_output_key,
+            enable_validation=itn_language_examples is None,
             **_resolve_stage_sampling(args, "itn"),
             **shared_model_kwargs,
         )
@@ -1222,26 +1305,6 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
         logger.info(f"ITN stage enabled: {itn_input_key} → {args.itn_output_key}")
 
     if args.enable_itn_no_disfluencies:
-        if not args.enable_itn:
-            logger.warning(
-                "--enable_itn_no-disfluencies requires --enable_itn (needs itn_raw as input). Enabling ITN automatically."
-            )
-            _itn_auto_stage = text_stage_cls(
-                name="ITNRestoration",
-                prompt_file=itn_prompt,
-                text_key=itn_input_key,
-                output_text_key=args.itn_output_key,
-                **_resolve_stage_sampling(args, "itn"),
-                **shared_model_kwargs,
-            )
-            # Same placement rule as the ITN block above.
-            if use_fusing and not args.enable_tn:
-                fuseable_sub_stages.append(_itn_auto_stage)
-            elif use_fusing:
-                post_fused_stages.append(_itn_auto_stage)
-            else:
-                stages.append(_itn_auto_stage)
-
         _disfl_stage = text_stage_cls(
             name="DisfluencyRemoval",
             prompt_file=itn_no_disfl_prompt,
@@ -1392,25 +1455,31 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
         logger.info(f"SpeechQA stage enabled: {post_tn_text_key} → {args.speech_qa_output_key}")
 
     # Fused stage assembly — one actor fires all collected sub-stage prompts in parallel.
+    fused_stage = None
     if use_fusing and fuseable_sub_stages:
-        stages.append(
-            FusedRemoteTextLLMStage(
-                sub_stages=fuseable_sub_stages,
-                inference_base_url=remote_base_url,
-                inference_api_key=args.inference_api_key,
-                served_model_name=remote_model_name,
-                max_concurrent_requests=args.inference_max_concurrent_requests,
-                request_timeout=args.inference_request_timeout,
-                batch_size=args.batch_size,
-            )
+        fused_stage = FusedRemoteTextLLMStage(
+            sub_stages=fuseable_sub_stages,
+            inference_base_url=remote_base_url,
+            inference_api_key=args.inference_api_key,
+            served_model_name=remote_model_name,
+            max_concurrent_requests=args.inference_max_concurrent_requests,
+            request_timeout=args.inference_request_timeout,
+            batch_size=args.batch_size,
         )
         logger.info(
             "FusedRemoteTextLLMStage assembled: %s sub-stages firing in parallel",
             [s.name for s in fuseable_sub_stages],
         )
-        # Post-fused stages depend on outputs written by the fused actor
-        # (llm_language_prediction → LLMLanguageVerification, itn_raw → DisfluencyRemoval).
-        stages.extend(post_fused_stages)
+
+    # These stages normally depend on outputs written by the fused actor
+    # (llm_language_prediction → LLMLanguageVerification, itn_raw → DisfluencyRemoval).
+    # They must still be appended when there are no fuseable stages, such as
+    # TN → ITN with --fuse_stages, where ITN runs serially after TN.
+    _append_fused_stage_sequence(
+        stages,
+        fused_stage=fused_stage,
+        post_fused_stages=post_fused_stages,
+    )
 
     if args.enable_instruction_packer:
         stages.append(
