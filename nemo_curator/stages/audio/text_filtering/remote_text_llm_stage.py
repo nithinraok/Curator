@@ -72,6 +72,7 @@ class RemoteTextLLMStage(TextLLMStage):
     served_model_name: str | None = None
     max_concurrent_requests: int = 64
     request_timeout: int = 120
+    ignore_skip_me: bool = False
 
     _client: Any = field(default=None, init=False, repr=False)
     _gen_config: Any = field(default=None, init=False, repr=False)
@@ -173,19 +174,29 @@ class RemoteTextLLMStage(TextLLMStage):
         waves = max(1, math.ceil(n_requests / concurrency))
         return per_request * waves + 120
 
-    def _generate_remote(self, messages_list: list[list[dict]]) -> list[str]:
-        """Fan out one chat request per message list, preserving order."""
+    def _generate_remote(self, messages_list: list[list[dict]]) -> list[tuple[str, bool]]:
+        """Fan out one chat request per message list, preserving order.
+
+        Returns ``(text, ok)`` per request. A per-request failure (e.g. the vLLM
+        Rust detokenizer byte-boundary panic on some generations) is caught here
+        and flagged ``ok=False`` so one bad row is SKIPped by the caller instead
+        of failing the whole batch/shard.
+        """
         model = self.served_model_name or self.model_id
 
-        async def _one(messages: list[dict]) -> str:
-            resp = await self._client.query_model(
-                messages=messages,
-                model=model,
-                generation_config=self._gen_config,
-            )
-            return ((resp[0] if resp else None) or "").strip()  # server can return [None] for empty completions
+        async def _one(messages: list[dict]) -> tuple[str, bool]:
+            try:
+                resp = await self._client.query_model(
+                    messages=messages,
+                    model=model,
+                    generation_config=self._gen_config,
+                )
+                return (((resp[0] if resp else None) or "").strip(), True)
+            except Exception as exc:  # noqa: BLE001 — isolate one bad row
+                logger.warning("{}: request failed; marking SKIP: {}", self.name, str(exc)[:200])
+                return ("", False)
 
-        async def _all() -> list[str]:
+        async def _all() -> list[tuple[str, bool]]:
             return await asyncio.gather(*[_one(m) for m in messages_list])
 
         # Drive every batch on the actor's single persistent event loop (bound
@@ -205,7 +216,7 @@ class RemoteTextLLMStage(TextLLMStage):
 
         for i, task in self._source_language_enabled_tasks(tasks):
             text = task.data.get(self.text_key, "")
-            skip = task.data.get(self.skip_me_key, "")
+            skip = task.data.get(self.skip_me_key, "") if not self.ignore_skip_me else ""
             if skip:
                 task.data[self.output_text_key] = ""
                 set_note(task.data, self.name, "skipped (flagged)", self.notes_key)
@@ -223,7 +234,15 @@ class RemoteTextLLMStage(TextLLMStage):
             for seq_idx, task_idx in enumerate(valid_indices):
                 task = tasks[task_idx]
                 input_text = task.data[self.text_key]
-                result_text = results[seq_idx]
+                result_text, req_ok = results[seq_idx]
+
+                if not req_ok:
+                    task.data[self.output_text_key] = (
+                        "SKIP" if self.output_text_key == "speech_qa_text" else input_text
+                    )
+                    set_note(task.data, self.name, "skipped (generation_error)", self.notes_key)
+                    self._n_processed += 1
+                    continue
 
                 if self.enable_validation:
                     ok, reason = self._validate(input_text, result_text)
