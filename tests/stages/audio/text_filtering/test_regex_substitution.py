@@ -132,3 +132,33 @@ def test_preserves_existing_skip_me_on_empty_result(tmp_path: Path) -> None:
     task = AudioTask(data={"cleaned_text": "hello", "skip_me": "Hallucination"})
     result = stage.process(task)
     assert result.data["skip_me"] == "Hallucination"
+
+
+_COMMON_YAML = (
+    Path(__file__).resolve().parents[4] / "tutorials" / "audio" / "granary_v2_postprocessing" / "common.yaml"
+)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "cũ kỹ nhưng vẫn dùng được",  # "old" — has ũ
+        "nghĩ về chuyện cũ",  # "think about the old thing" — has ĩ and ũ
+        "một bác sĩ giỏi",  # "a good doctor" — has ĩ
+    ],
+)
+def test_common_yaml_preserves_vietnamese_plain_tilde_vowels(text: str) -> None:
+    """Regression test: U+0128/0129 (Ĩĩ) and U+0168/0169 (Ũũ) must survive the production
+    character whitelist. These were previously missing from the whitelist's Vietnamese
+    coverage, so the regex silently stripped them (e.g. "cũ" -> "c "), even though the ASR
+    prediction was correct — and the LLM post-processing stages only partially recovered
+    the loss downstream.
+    """
+    stage = RegexSubstitutionStage(regex_params_yaml=str(_COMMON_YAML), text_key="cleaned_text")
+    stage.setup()
+    task = AudioTask(data={"cleaned_text": text, "_skipme": ""})
+    result = stage.process(task)
+    assert "ĩ" in result.data["cleaned_text"] or "ĩ" not in text
+    assert "ũ" in result.data["cleaned_text"] or "ũ" not in text
+    # No word should have been reduced to nothing by the whitelist.
+    assert len(result.data["cleaned_text"].split()) == len(text.split())
