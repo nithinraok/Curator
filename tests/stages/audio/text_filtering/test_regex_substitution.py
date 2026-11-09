@@ -142,23 +142,42 @@ _COMMON_YAML = (
 @pytest.mark.parametrize(
     "text",
     [
-        "cũ kỹ nhưng vẫn dùng được",  # "old" — has ũ
-        "nghĩ về chuyện cũ",  # "think about the old thing" — has ĩ and ũ
-        "một bác sĩ giỏi",  # "a good doctor" — has ĩ
+        "mình cũng biết mà",  # vi: ũ U+0169
+        "nghĩ về chuyện cũ",  # vi: ĩ U+0129 and ũ
+        "một bác sĩ giỏi",  # vi: ĩ
+        "NOËL",  # fr: Ë U+00CB
+        "AOÛT",  # fr: Û U+00DB
+        "MAÏS",  # fr: Ï U+00CF
+        "όλους τους ανθρώπους",  # el: final sigma ς U+03C2
+        "Ίσως Ύστερα Ώρα",  # el: Ί U+038A, Ύ U+038E, Ώ U+038F
+        "προϋπόθεση ταΐζω",  # el: ϋ U+03CB, ΐ U+0390
+        "ΠΡΟΫΠΟΘΕΣΗ ΤΑΪΖΩ",  # el: Ϋ U+03AB, Ϊ U+03AA
+        "naţiune Ţara",  # ro: legacy cedilla ţ U+0163, Ţ U+0162
+        "Α΄ Παγκόσμιος Πόλεμος",  # el: numeral sign/keraia ΄ U+0384
+        "тя ѝ каза",  # bg: ѝ U+045D
+        "Ѝ и ѐ",  # bg: Ѝ U+040D, ѐ U+0450
+        "ĳsje",  # nl: ĳ U+0133
+        "人々は時々",  # ja: 々 U+3005
+        "二〇二四年",  # zh/ja: 〇 U+3007
     ],
 )
-def test_common_yaml_preserves_vietnamese_plain_tilde_vowels(text: str) -> None:
-    """Regression test: U+0128/0129 (Ĩĩ) and U+0168/0169 (Ũũ) must survive the production
-    character whitelist. These were previously missing from the whitelist's Vietnamese
-    coverage, so the regex silently stripped them (e.g. "cũ" -> "c "), even though the ASR
-    prediction was correct — and the LLM post-processing stages only partially recovered
-    the loss downstream.
+def test_production_whitelist_preserves_covered_language_letters(text: str) -> None:
+    """Letters absent from the whitelist are silently replaced by a space.
+
+    Ĩĩ/Ũũ and the uppercase Ë/Ï/Û were missing, so correct predictions lost them
+    mid-word: "cũng" became "c ng" and "NOËL" became "NO L". The same gap hit the
+    Greek final sigma ς ("τους" -> "του "), Romanian cedilla ţ, Bulgarian ѝ and the
+    CJK iteration mark 々 ("人々" -> "人 "). Every one of these languages is in the
+    rule file's declared coverage, so a covered letter must survive intact.
     """
-    stage = RegexSubstitutionStage(regex_params_yaml=str(_COMMON_YAML), text_key="cleaned_text")
+    stage = RegexSubstitutionStage(
+        regex_params_yaml=str(_COMMON_YAML),
+        text_key="pred_text",
+        output_text_key="cleaned_text",
+    )
     stage.setup()
-    task = AudioTask(data={"cleaned_text": text, "_skipme": ""})
-    result = stage.process(task)
-    assert "ĩ" in result.data["cleaned_text"] or "ĩ" not in text
-    assert "ũ" in result.data["cleaned_text"] or "ũ" not in text
-    # No word should have been reduced to nothing by the whitelist.
-    assert len(result.data["cleaned_text"].split()) == len(text.split())
+    task = AudioTask(data={"pred_text": text})
+
+    stage.process(task)
+
+    assert task.data["cleaned_text"] == text
