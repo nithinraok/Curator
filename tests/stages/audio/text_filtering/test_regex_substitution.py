@@ -162,3 +162,77 @@ def test_common_yaml_preserves_vietnamese_plain_tilde_vowels(text: str) -> None:
     assert "ũ" in result.data["cleaned_text"] or "ũ" not in text
     # No word should have been reduced to nothing by the whitelist.
     assert len(result.data["cleaned_text"].split()) == len(text.split())
+
+
+def _run(stage: RegexSubstitutionStage, text: str, language: str | None, key: str = "source_lang") -> str:
+    data = {"pred_text": text}
+    if language is not None:
+        data[key] = language
+    return stage.process(AudioTask(data=data)).data["cleaned_text"]
+
+
+def _lang_stage(tmp_path: Path, rules: list[dict], **kwargs: str) -> RegexSubstitutionStage:
+    stage = RegexSubstitutionStage(regex_params_yaml=_write_rules(tmp_path, rules), **kwargs)
+    stage.setup()
+    return stage
+
+
+@pytest.mark.parametrize(
+    ("language", "expected"),
+    [("el", "a; b"), ("el-GR", "a; b"), ("EL", "a; b"), ("en", "a, b"), (None, "a, b"), ("", "a, b")],
+)
+def test_exclude_langs_skips_listed_languages(tmp_path: Path, language: str | None, expected: str) -> None:
+    stage = _lang_stage(tmp_path, [{"pattern": ";", "repl": ",", "exclude_langs": ["el"]}])
+    assert _run(stage, "a; b", language) == expected
+
+
+@pytest.mark.parametrize(("language", "expected"), [("el", "a; b"), ("el_GR", "a; b"), ("en", "a? b"), (None, "a? b")])
+def test_langs_applies_only_to_listed_languages(tmp_path: Path, language: str | None, expected: str) -> None:
+    stage = _lang_stage(tmp_path, [{"pattern": r"\?", "repl": ";", "langs": ["el"]}])
+    assert _run(stage, "a? b", language) == expected
+
+
+def test_language_key_is_configurable(tmp_path: Path) -> None:
+    stage = _lang_stage(tmp_path, [{"pattern": "x", "repl": "y", "langs": ["el"]}], language_key="lang")
+    data = {"pred_text": "x", "lang": "el", "source_lang": "en"}
+    assert stage.process(AudioTask(data=data)).data["cleaned_text"] == "y"
+
+
+@pytest.mark.parametrize(
+    ("rule", "error", "message"),
+    [
+        ({"pattern": "x", "repl": "", "langs": ["el"], "exclude_langs": ["en"]}, ValueError, "both langs and"),
+        ({"pattern": "x", "repl": "", "langs": "el"}, TypeError, "langs must be a non-empty list"),
+        ({"pattern": "x", "repl": "", "langs": []}, TypeError, "langs must be a non-empty list"),
+        ({"pattern": "x", "repl": "", "exclude_langs": [""]}, TypeError, "exclude_langs must be a non-empty list"),
+        ({"pattern": "x", "repl": "", "exclude_langs": [1]}, TypeError, "exclude_langs must be a non-empty list"),
+    ],
+)
+def test_rejects_invalid_language_filters(tmp_path: Path, rule: dict, error: type[Exception], message: str) -> None:
+    stage = RegexSubstitutionStage(regex_params_yaml=_write_rules(tmp_path, [rule]))
+    with pytest.raises(error, match=message):
+        stage.setup()
+
+
+@pytest.mark.parametrize(
+    ("text", "language", "expected"),
+    [
+        # Greek ';' is the question mark: kept, and Latin '?' / U+037E are unified to it.
+        ("Πού τα βρήκατε;", "el", "Πού τα βρήκατε;"),
+        ("Πού τα βρήκατε?", "el", "Πού τα βρήκατε;"),
+        ("Πού τα βρήκατε\u037e", "el", "Πού τα βρήκατε;"),
+        ("Ήρθε; Όχι ακόμα.", "el", "Ήρθε; Όχι ακόμα."),
+        # Ano teleia (U+0387 / U+00B7, the Greek semicolon) becomes a comma.
+        ("Ήρθε\u0387 μετά έφυγε.", "el", "Ήρθε, μετά έφυγε."),
+        ("Ήρθε\u00b7 μετά έφυγε.", "el", "Ήρθε, μετά έφυγε."),
+        # Other languages keep the old behaviour.
+        ("first; second", "en", "first, second"),
+        ("Where is it?", "en", "Where is it?"),
+        ("premier; second", "fr", "premier, second"),
+        ("first; second", None, "first, second"),
+    ],
+)
+def test_common_yaml_keeps_greek_question_mark(text: str, language: str | None, expected: str) -> None:
+    stage = RegexSubstitutionStage(regex_params_yaml=str(_COMMON_YAML))
+    stage.setup()
+    assert _run(stage, text, language) == expected

@@ -1141,6 +1141,7 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
                 regex_params_yaml=args.regex_yaml,
                 text_key="best_prediction",
                 output_text_key="cleaned_text",
+                language_key=args.source_lang_key,
             ),
             AbbreviationConcatStage(
                 text_key="cleaned_text",
