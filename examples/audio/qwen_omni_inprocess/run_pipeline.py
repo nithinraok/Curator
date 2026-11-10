@@ -26,9 +26,9 @@ Model selection:
         qwen_asr       → InferenceQwenASRStage         (Qwen3-ASR vLLM, ``--asr_model_id``)
                          recommended: th fil fa (recovery: whisper)
         parakeet_v3    → InferenceParakeetStage        (Parakeet-TDT v3, ``--parakeet_v3_model_id``)
-                         recommended: pl cs ro hu el fi da sv
+                         recommended: pl cs ro hu fi da sv
         whisper        → InferenceFasterWhisperStage   (Whisper Large V3, ``--whisper_model_size_or_path``)
-                         recommended: lt lv hr et bg sk sl mt uk (he: recovery none, Whisper only)
+                         recommended: lt lv hr et bg sk sl mt uk el (he: recovery none, Whisper only)
         indic_canary   → InferenceIndicCanaryStage      (prebuilt TensorRT-LLM (Indic) Canary engine,
                          ``--indic_canary_engine_dir``; needs tensorrt_llm)
                          primary for all Indic langs; recovery: hi → parakeet_riva (Riva Indic),
@@ -133,8 +133,9 @@ QWEN_OMNI_RECOMMENDED_LANGS = {
     "vi",
     "tr",
 }  # id/vi/tr → qwen_omni primary, qwen_asr recovery
-PARAKEET_V3_PRIMARY_LANGS = {"pl", "cs", "ro", "hu", "el", "fi", "da", "sv"}
-WHISPER_RECOMMENDED_LANGS = {"lt", "lv", "hr", "et", "bg", "sk", "sl", "mt", "uk", "he"}
+PARAKEET_V3_PRIMARY_LANGS = {"pl", "cs", "ro", "hu", "fi", "da", "sv"}
+# el is Whisper-primary: Parakeet-TDT v3 never emits final sigma (ς), so Greek transcripts lose it.
+WHISPER_RECOMMENDED_LANGS = {"lt", "lv", "hr", "et", "bg", "sk", "sl", "mt", "uk", "he", "el"}
 # Languages using Qwen3-ASR as primary with Whisper Large V3 as recovery (th/fil/fa).
 QWEN_ASR_PRIMARY_LANGS = frozenset({"th", "fil", "fa"})
 # Whisper-primary languages that take NO recovery model (Whisper Large V3 only). Hebrew has no
