@@ -225,9 +225,12 @@ def test_rejects_invalid_language_filters(tmp_path: Path, rule: dict, error: typ
         # Ano teleia (U+0387 / U+00B7, the Greek semicolon) becomes a comma.
         ("Ήρθε\u0387 μετά έφυγε.", "el", "Ήρθε, μετά έφυγε."),
         ("Ήρθε\u00b7 μετά έφυγε.", "el", "Ήρθε, μετά έφυγε."),
+        # Repeated marks collapse to one (Greek '?' becomes ';' before the trailing cleanup).
+        ("Πού ήσουν?? Εδώ;; Τι;;", "el", "Πού ήσουν; Εδώ; Τι;"),
         # Other languages keep the old behaviour.
         ("first; second", "en", "first, second"),
         ("Where is it?", "en", "Where is it?"),
+        ("Where?? Here;;", "en", "Where? Here,"),
         ("premier; second", "fr", "premier, second"),
         ("first; second", None, "first, second"),
     ],
