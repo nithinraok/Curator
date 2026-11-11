@@ -226,7 +226,7 @@ def test_rejects_invalid_language_filters(tmp_path: Path, rule: dict, error: typ
         ("Ήρθε\u0387 μετά έφυγε.", "el", "Ήρθε, μετά έφυγε."),
         ("Ήρθε\u00b7 μετά έφυγε.", "el", "Ήρθε, μετά έφυγε."),
         # Repeated marks collapse to one (Greek '?' becomes ';' before the trailing cleanup).
-        ("Πού ήσουν?? Εδώ;; Τι;;", "el", "Πού ήσουν; Εδώ; Τι;"),
+        ("Πού ήσουν?? Εδώ;; Γιατί;;", "el", "Πού ήσουν; Εδώ; Γιατί;"),
         # Other languages keep the old behaviour.
         ("first; second", "en", "first, second"),
         ("Where is it?", "en", "Where is it?"),
