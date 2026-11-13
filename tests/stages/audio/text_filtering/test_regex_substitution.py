@@ -239,3 +239,20 @@ def test_common_yaml_keeps_greek_question_mark(text: str, language: str | None, 
     stage = RegexSubstitutionStage(regex_params_yaml=str(_COMMON_YAML))
     stage.setup()
     assert _run(stage, text, language) == expected
+
+
+@pytest.mark.parametrize(
+    ("text", "language", "expected"),
+    [
+        # ro: legacy cedilla \u0163/\u0162/\u015f/\u015e -> comma-below \u021b/\u021a/\u0219/\u0218
+        ("na\u0163iune \u0162ara a\u015fa \u015etefan", "ro", "na\u021biune \u021aara a\u0219a \u0218tefan"),
+        ("na\u0163iune", "ro-RO", "na\u021biune"),
+        # tr: the cedilla \u015f/\u015e is the correct Turkish letter and must survive
+        ("ya\u015f\u0131yor \u015ei\u015fli", "tr", "ya\u015f\u0131yor \u015ei\u015fli"),
+    ],
+)
+def test_common_yaml_romanian_cedilla_to_comma(text: str, language: str, expected: str) -> None:
+    """Romanian \u0219/\u021b are often typed as the legacy cedilla forms; only Romanian is normalized."""
+    stage = RegexSubstitutionStage(regex_params_yaml=str(_COMMON_YAML))
+    stage.setup()
+    assert _run(stage, text, language) == expected

@@ -85,6 +85,12 @@
 - {"pattern": '\?', "repl": ";", "langs": ["el"]}
 - {"pattern": "[\u0387\u00B7]", "repl": ",", "langs": ["el"]}
 - {"pattern": ";", "repl": ",", "exclude_langs": ["el"]}
+# Romanian: legacy cedilla ş/ţ (U+015F/0163) -> the correct comma-below ș/ț (U+0219/021B).
+# Romanian-only, because Turkish needs the cedilla ş. The comma-below forms are whitelisted.
+- {"pattern": "\u0163", "repl": "\u021B", "langs": ["ro"]}
+- {"pattern": "\u0162", "repl": "\u021A", "langs": ["ro"]}
+- {"pattern": "\u015F", "repl": "\u0219", "langs": ["ro"]}
+- {"pattern": "\u015E", "repl": "\u0218", "langs": ["ro"]}
 
 # Bracketed content removal
 - {"pattern": '\[[^\]]*\]', "repl": ""} # delete content inside []
