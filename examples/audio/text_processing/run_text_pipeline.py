@@ -173,7 +173,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=False,
         help=(
-            "Enable acoustic distractor stage (CPU-only): G2Ps fine_context_terms via phonemizer "
+            "Enable acoustic distractor stage (CPU-only): G2Ps fine_context_terms with a configured backend "
             "and appends phonetically-similar words from --phoneme_vocab_path to context_asr.distractor_terms. "
             "Requires --enable_context_asr and --phoneme_vocab_path."
         ),
@@ -347,9 +347,36 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         help=(
-            "Optional espeak-ng language code (e.g. en-us, fr, de, cmn). When set, used for all samples; "
-            "otherwise the per-sample source_lang is mapped to an espeak code."
+            "Optional G2P language name/code (e.g. English, en, fr, zh). When set, used for all samples; "
+            "otherwise the per-sample source_lang selects the language."
         ),
+    )
+    ad.add_argument(
+        "--g2p_backend",
+        type=str,
+        default="auto",
+        help=(
+            "G2P backend for legacy/plain vocab files or metadata-free fallback: auto, mfa, phonikud, "
+            "g2p-en, pypinyin, nrc_g2p, epitran, segments, or rules."
+        ),
+    )
+    ad.add_argument(
+        "--g2p_model_path",
+        type=str,
+        default=None,
+        help="MFA G2P model name/path, or a directory containing per-language MFA model archives.",
+    )
+    ad.add_argument(
+        "--segments_profile_path",
+        type=str,
+        default=None,
+        help="CLDF segments profile path, required only when using --g2p_backend segments.",
+    )
+    ad.add_argument(
+        "--mfa_command",
+        type=str,
+        default="mfa",
+        help="Montreal Forced Aligner CLI command name/path used by the MFA backend.",
     )
     ad.add_argument(
         "--max_acoustic_distractors",
@@ -563,6 +590,10 @@ def main() -> None:  # noqa: C901, PLR0915
                     context_key=args.context_asr_output_key,
                     source_lang_key="source_lang",
                     language=args.phoneme_vocab_language,
+                    g2p_backend=args.g2p_backend,
+                    g2p_model_path=args.g2p_model_path,
+                    segments_profile_path=args.segments_profile_path,
+                    mfa_command=args.mfa_command,
                     phoneme_vocab_path=args.phoneme_vocab_path,
                     max_acoustic_distractors=args.max_acoustic_distractors,
                     max_total_distractors=args.max_total_distractors,
@@ -573,7 +604,7 @@ def main() -> None:  # noqa: C901, PLR0915
             )
             logger.info(
                 f"AcousticDistractor stage enabled: vocab={args.phoneme_vocab_path} "
-                f"(language={args.phoneme_vocab_language or 'per-sample'}, "
+                f"(language={args.phoneme_vocab_language or 'per-sample'}, backend={args.g2p_backend}, "
                 f"max_acoustic={args.max_acoustic_distractors}, total_cap={args.max_total_distractors})"
             )
         stages.append(
