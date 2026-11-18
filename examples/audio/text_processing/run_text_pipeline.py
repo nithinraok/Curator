@@ -87,16 +87,12 @@ from __future__ import annotations
 import argparse
 import json
 import os
-from dataclasses import dataclass, field
 from pathlib import Path
 
 from loguru import logger
 
 from nemo_curator.pipeline import Pipeline
 from nemo_curator.stages.audio.alm.alm_manifest_reader import ALMManifestReader
-from nemo_curator.stages.base import ProcessingStage
-from nemo_curator.stages.resources import Resources
-from nemo_curator.tasks import AudioTask
 from nemo_curator.stages.audio.alm.sharded_manifest_writer import ShardedManifestWriterStage
 from nemo_curator.stages.audio.text_filtering.acoustic_distractor import AcousticDistractorStage
 from nemo_curator.stages.audio.text_filtering.contextual_asr_extraction import ContextualASRExtractionStage
@@ -148,49 +144,6 @@ _CODE_SWITCHING_PROMPT = _PROMPT_DIR / "code_switching_prompt.md"
 _SPEECH_QA_PROMPT = _PROMPT_DIR / "speech_qa_prompt.md"
 _LANGUAGE_ID_PROMPT = _PROMPT_DIR / "language_id_prompt.md"
 _RECOVER_ENTITIES_PROMPT = _PROMPT_DIR / "recover_entities_prompt.md"
-
-@dataclass
-class FieldCopyStage(ProcessingStage[AudioTask, AudioTask]):
-    """Copy one manifest field to another (CPU, zero-cost).
-
-    Useful for aliasing stage outputs — e.g. copying ``pnc_text`` → ``tn_raw``
-    so downstream stages that read ``tn_raw`` receive the PnC result when the
-    TN stage is disabled.  Records with a non-empty ``_skipme`` are passed
-    through unchanged (dst_key is still written as empty string for schema
-    consistency).
-    """
-
-    src_key: str = ""
-    dst_key: str = ""
-    name: str = "FieldCopy"
-    skip_me_key: str = "_skipme"
-    ignore_skip_me: bool = False
-    resources: Resources = field(default_factory=lambda: Resources(cpus=1.0))
-
-    def __post_init__(self) -> None:
-        if not self.src_key or not self.dst_key:
-            msg = "FieldCopyStage requires non-empty src_key and dst_key"
-            raise ValueError(msg)
-
-    def inputs(self) -> tuple[list[str], list[str]]:
-        return [], [self.src_key, self.skip_me_key]
-
-    def outputs(self) -> tuple[list[str], list[str]]:
-        return [], [self.dst_key]
-
-    def _copy(self, task: AudioTask) -> AudioTask:
-        if not self.ignore_skip_me and task.data.get(self.skip_me_key, ""):
-            task.data.setdefault(self.dst_key, "")
-        else:
-            task.data[self.dst_key] = task.data.get(self.src_key, "")
-        return task
-
-    def process(self, task: AudioTask) -> AudioTask:
-        return self._copy(task)
-
-    def process_batch(self, tasks: list[AudioTask]) -> list[AudioTask]:
-        return [self._copy(t) for t in tasks]
-
 
 _LANGUAGE_ID_BACKENDS = frozenset({"llm", "fasttext", "indiclid", "config"})
 _CPU_LANGUAGE_ID_BACKENDS = frozenset({"fasttext", "indiclid"})
@@ -581,6 +534,20 @@ def _build_arg_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
         "Pass --ignore_skip_me to process flagged records too.",
     )
     ap.add_argument(
+        "--only_high_quality",
+        action="store_true",
+        default=False,
+        help="Only process rows where high_quality=True; rows with high_quality=False "
+             "are passed through unchanged (same behaviour as _skipme rows). "
+             "Combined with --only_high_quality_key to customise the field name.",
+    )
+    ap.add_argument(
+        "--only_high_quality_key",
+        type=str,
+        default="high_quality",
+        help="Manifest field used by --only_high_quality filter (default: high_quality).",
+    )
+    ap.add_argument(
         "--enable_instruction_packer",
         action="store_true",
         default=False,
@@ -620,8 +587,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
         type=str,
         default=None,
         help=(
-            "Input field for ITN. Defaults to --code_switching_output_key when code switching is enabled; "
-            "otherwise defaults to TN output when TN is enabled, or --text_key."
+            "Input field for ITN. Defaults to TN output when TN is enabled, otherwise PnC output "
+            "when PnC is enabled, or --text_key. Set explicitly to use code-switching output."
         ),
     )
     ap.add_argument("--itn_output_key", type=str, default="itn_raw", help="Output field for ITN result.")
@@ -1402,23 +1369,18 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
     else:
         langid_text_key = downstream_recovered or (args.pnc_output_key if args.enable_pnc else "pnc_text")
 
-    # ITN reads tn_raw (TN's spoken form) when TN is enabled, else the base text.
-    default_itn_input_key = args.tn_output_key if args.enable_tn else base_text_key
-    # In a combined CodeSwitching -> ITN run, make the dependency explicit.
-    # ITN-only runs keep their historical TN/base-text default.
-    itn_input_key = args.itn_text_key or (
-        args.code_switching_output_key if args.enable_code_switching else default_itn_input_key
-    )
-    itn_reads_code_switching = args.enable_code_switching and itn_input_key == args.code_switching_output_key
     # Captioning/CodeSwitching/SpeechQA read TN's output (tn_raw) when TN is on, else the PnC
     # output (pnc_text) when PnC is enabled, else the base text.  This ensures downstream stages
     # always operate on the punctuated text rather than the raw ASR key (e.g. granary_v1_prediction).
     if args.enable_tn:
-        post_tn_text_key = itn_input_key
+        post_tn_text_key = args.tn_output_key
     elif args.enable_pnc:
         post_tn_text_key = args.pnc_output_key   # typically "pnc_text"
     else:
         post_tn_text_key = base_text_key
+
+    # ITN follows the normal TN/PnC/base-text flow unless explicitly overridden.
+    itn_input_key = args.itn_text_key or post_tn_text_key
 
     stages = [
         ALMManifestReader(manifest_path=args.input_manifest, output_dir=args.output_dir, fanout=False),
@@ -1549,20 +1511,9 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
                 **shared_model_kwargs,
             )
         )
-        # Copy pnc_text → tn_raw so downstream stages that read tn_raw (ITN,
-        # Captioning, CodeSwitching, SpeechQA when TN is disabled) receive the
-        # punctuated text rather than the raw abbreviated_text.
-        stages.append(
-            FieldCopyStage(
-                name="PnC→tn_raw",
-                src_key=args.pnc_output_key,
-                dst_key=args.tn_output_key,
-                ignore_skip_me=args.ignore_skip_me,
-            )
-        )
         logger.info(
-            "PnC stage enabled: %s → %s (also copied to %s)",
-            pnc_input_key, args.pnc_output_key, args.tn_output_key,
+            "PnC stage enabled: %s → %s",
+            pnc_input_key, args.pnc_output_key,
         )
 
     if args.enable_language_id and not args.language_id_first:
@@ -1621,12 +1572,16 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
             text_key=itn_input_key,
             output_text_key=args.itn_output_key,
             enable_validation=itn_language_examples is None,
+            require_true_key=args.only_high_quality_key if args.only_high_quality else "",
             **_resolve_stage_sampling(args, "itn"),
             **shared_model_kwargs,
         )
-        # A stage that reads code_switched_text must run after the fused actor
-        # that produces it. Independent ITN remains fuseable as before.
-        if use_fusing and itn_reads_code_switching:
+        # Only an explicit CS-output override depends on the fused CS stage.
+        if (
+            use_fusing
+            and args.enable_code_switching
+            and args.itn_text_key == args.code_switching_output_key
+        ):
             post_fused_stages.append(_itn_stage)
         elif use_fusing and not args.enable_tn:
             fuseable_sub_stages.append(_itn_stage)
@@ -1634,7 +1589,11 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
             post_fused_stages.append(_itn_stage)
         else:
             stages.append(_itn_stage)
-        logger.info(f"ITN stage enabled: {itn_input_key} → {args.itn_output_key}")
+        logger.info(
+            f"ITN stage enabled: {itn_input_key} → {args.itn_output_key}"
+            + (f"  [only_high_quality: require_true_key={args.only_high_quality_key}]"
+               if args.only_high_quality else "")
+        )
 
     if args.enable_itn_no_disfluencies:
         _disfl_stage = text_stage_cls(

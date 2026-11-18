@@ -180,6 +180,9 @@ class FusedRemoteTextLLMStage(ProcessingStage["AudioTask", "AudioTask"]):
             for i, task in sub._source_language_enabled_tasks(tasks):
                 text = task.data.get(sub.text_key, "")
                 skip = task.data.get(sub.skip_me_key, "") if not getattr(sub, "ignore_skip_me", False) else ""
+                _rtk = getattr(sub, "require_true_key", "")
+                if not skip and _rtk and not task.data.get(_rtk):
+                    skip = f"require_true_key ({_rtk}=False)"
                 if skip:
                     task.data[sub.output_text_key] = ""
                     set_note(task.data, sub.name, "skipped (flagged)", sub.notes_key)

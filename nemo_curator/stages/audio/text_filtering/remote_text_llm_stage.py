@@ -217,6 +217,8 @@ class RemoteTextLLMStage(TextLLMStage):
         for i, task in self._source_language_enabled_tasks(tasks):
             text = task.data.get(self.text_key, "")
             skip = task.data.get(self.skip_me_key, "") if not self.ignore_skip_me else ""
+            if not skip and self.require_true_key and not task.data.get(self.require_true_key):
+                skip = f"require_true_key ({self.require_true_key}=False)"
             if skip:
                 task.data[self.output_text_key] = ""
                 set_note(task.data, self.name, "skipped (flagged)", self.notes_key)

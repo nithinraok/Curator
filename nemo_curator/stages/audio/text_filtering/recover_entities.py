@@ -128,6 +128,7 @@ class RecoverEntitiesStage(ProcessingStage[AudioTask, AudioTask]):
     normalized_key: str = "normalized_text"
     output_text_key: str = "entity_recovered_text"
     skip_me_key: str = "_skipme"
+    ignore_skip_me: bool = False
     notes_key: str = "additional_notes"
     tensor_parallel_size: int | None = None
     max_output_tokens: int = 1024

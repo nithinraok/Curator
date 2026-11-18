@@ -144,19 +144,31 @@ class RemoteRecoverEntitiesStage(RecoverEntitiesStage):
         waves = max(1, math.ceil(n_requests / concurrency))
         return per_request * waves + 120
 
-    def _generate_remote(self, messages_list: list[list[dict]]) -> list[str]:
+    def _generate_remote(self, messages_list: list[list[dict]]) -> list[str | None]:
         """Fan out one chat request per message list, preserving order."""
         model = self.served_model_name or self.model_id
 
-        async def _one(messages: list[dict]) -> str:
-            resp = await self._client.query_model(
-                messages=messages,
-                model=model,
-                generation_config=self._gen_config,
-            )
+        async def _one(messages: list[dict]) -> str | None:
+            try:
+                resp = await self._client.query_model(
+                    messages=messages,
+                    model=model,
+                    generation_config=self._gen_config,
+                )
+            except Exception as exc:
+                # A Unicode panic is record-local; do not discard successful peers.
+                error = str(exc)
+                if "JoinError::Panic" not in error or "not a char boundary" not in error:
+                    raise
+                logger.warning(
+                    "{}: server Unicode panic ({}); preserving normalized input for this record",
+                    self.name,
+                    type(exc).__name__,
+                )
+                return None
             return ((resp[0] if resp else None) or "").strip()  # server can return [None] for empty completions
 
-        async def _all() -> list[str]:
+        async def _all() -> list[str | None]:
             return await asyncio.gather(*[_one(m) for m in messages_list])
 
         # Drive every batch on the actor's single persistent event loop (bound
@@ -200,6 +212,11 @@ class RemoteRecoverEntitiesStage(RecoverEntitiesStage):
             for seq_idx, task_idx in enumerate(valid_indices):
                 task = tasks[task_idx]
                 normalized = task.data[self.normalized_key]
+                if results[seq_idx] is None:
+                    task.data[self.output_text_key] = normalized
+                    set_note(task.data, self.name, "fallback (server Unicode panic)", self.notes_key)
+                    self._n_processed += 1
+                    continue
                 result_text = _clean_response(results[seq_idx])
                 # Guard against empty / degenerate generations: fall back to the
                 # normalized text so we never drop content.
