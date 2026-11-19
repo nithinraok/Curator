@@ -29,7 +29,10 @@ class RegexSubstitutionStage(ProcessingStage[AudioTask, AudioTask]):
     """Apply a sequence of regex substitutions to a text field in each AudioTask.
 
     Rules are loaded from a YAML file containing a list of dicts with
-    ``pattern`` and ``repl`` keys (and an optional ``count`` key).
+    ``pattern`` and ``repl`` keys (and an optional ``count`` key). A rule may also define
+    ``langs`` (apply only to those languages) or ``exclude_langs`` (apply to every language
+    except those), each a list of codes matched against ``language_key``; a region suffix such
+    as ``el-GR`` matches ``el``. A row without a language gets every rule that has no ``langs``.
 
     Reads from ``text_key`` (default ``"pred_text"``), applies all rules,
     and writes the result to ``output_text_key`` (default ``"cleaned_text"``).
@@ -46,6 +49,7 @@ class RegexSubstitutionStage(ProcessingStage[AudioTask, AudioTask]):
     text_key: str = "pred_text"
     output_text_key: str = "cleaned_text"
     skip_me_key: str = "_skipme"
+    language_key: str = "source_lang"
     name: str = "RegexSubstitution"
     resources: Resources = field(default_factory=lambda: Resources(cpus=1.0))
 
@@ -60,8 +64,31 @@ class RegexSubstitutionStage(ProcessingStage[AudioTask, AudioTask]):
     def setup(self, _worker_metadata: object | None = None) -> None:
         with open(self.regex_params_yaml, encoding="utf-8") as f:
             self._rules = yaml.safe_load(f)
+        for index, rule in enumerate(self._rules):
+            self._validate_language_filter(index, rule)
         self._setup_called = True
         logger.info(f"RegexSubstitutionStage: loaded {len(self._rules)} rules from {self.regex_params_yaml}")
+
+    @staticmethod
+    def _validate_language_filter(index: int, rule: dict[str, Any]) -> None:
+        if "langs" in rule and "exclude_langs" in rule:
+            msg = f"Regex rule {index} must not define both langs and exclude_langs"
+            raise ValueError(msg)
+        for key in ("langs", "exclude_langs"):
+            langs = rule.get(key)
+            if key in rule and not (
+                isinstance(langs, list) and langs and all(isinstance(x, str) and x for x in langs)
+            ):
+                msg = f"Regex rule {index} {key} must be a non-empty list of language codes"
+                raise TypeError(msg)
+
+    @staticmethod
+    def _applies(rule: dict[str, Any], language: str | None) -> bool:
+        if "langs" in rule:
+            return language in {x.lower() for x in rule["langs"]}
+        if "exclude_langs" in rule:
+            return language not in {x.lower() for x in rule["exclude_langs"]}
+        return True
 
     def inputs(self) -> tuple[list[str], list[str]]:
         return [], [self.text_key]
@@ -77,8 +104,12 @@ class RegexSubstitutionStage(ProcessingStage[AudioTask, AudioTask]):
         if not isinstance(text, str):
             return task
         had_text = bool(text.strip())
+        lang = task.data.get(self.language_key)
+        lang = re.split(r"[-_]", lang.strip(), maxsplit=1)[0].lower() or None if isinstance(lang, str) else None
         text = " " + text + " "
         for rule in self._rules:
+            if not self._applies(rule, lang):
+                continue
             text = re.sub(rule["pattern"], rule["repl"], text, count=rule.get("count", 0))
         text = re.sub(r"\s+", " ", text).strip()
         task.data[self.output_text_key] = text
